@@ -3,6 +3,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pyqtgraph as pg
 import numpy as np
 from heka import reader as heka_reader
+from heka import analysis
 from heka.nanopore import calculate_pore_diameter, get_conductivity
 
 # Light modern theme: all colors in one place, tweak here only
@@ -15,6 +16,8 @@ THEME = {
     'readout':    '#1F1F1F',                    # readout text
     'readout_bg': (255, 255, 255, 190),         # translucent white panel
     'seam':       '#B0B0B0',                    # stitch seam dashed lines
+    'band':       '#76B7B2',                    # Detect threshold band (teal)
+    'event':      '#59A14F',                    # event highlight / event hists
     # Tableau 10 for <= 10 traces; Tableau 20 (deep+light shades) for <= 20;
     # beyond that a muted golden-ratio hue walk -- distinguishable, no neon
     'cycle':      ['#4E79A7', '#F28E2B', '#E15759', '#76B7B2', '#59A14F',
@@ -178,6 +181,18 @@ stitch_btn.setCheckable(True)
 stitch_btn.setChecked(settings.value('stitch', False, type=bool))
 w1l.addWidget(stitch_btn, 1, 2, 1, 2)
 
+# Checkable button toggling amplitude-histogram region selection (Amp mode:
+# left-drag in the plot adds a time region for the all-point histogram)
+amp_btn = pg.QtWidgets.QPushButton("Amp")
+amp_btn.setCheckable(True)
+w1l.addWidget(amp_btn, 2, 0)
+
+# Checkable button toggling threshold-band event detection (Detect mode:
+# a draggable horizontal band, events = samples inside it per the mode)
+detect_btn = pg.QtWidgets.QPushButton("Detect")
+detect_btn.setCheckable(True)
+w1l.addWidget(detect_btn, 2, 1)
+
 # Collapsible section: file tree
 sec_tree = Collapsible('File tree')
 tree = pg.QtWidgets.QTreeWidget()
@@ -204,7 +219,18 @@ plot.setClipToView(True)
 legend = plot.addLegend(brush=pg.mkBrush(255, 255, 255, 200),
                         pen=pg.mkPen('#CCCCCC'),
                         labelTextColor=THEME['fg'])
-hsplit.addWidget(plot)
+
+# Right column: main plot on top, collapsible Distribution panel below
+# (see the distribution section further down); the splitter keeps a fixed
+# panel height while the traces take the rest.
+dist_split = pg.QtWidgets.QSplitter(pg.QtCore.Qt.Vertical)
+dist_split.addWidget(plot)
+right_col = pg.QtWidgets.QWidget()
+right_lay = pg.QtWidgets.QGridLayout()
+right_lay.setContentsMargins(0, 0, 0, 0)
+right_col.setLayout(right_lay)
+right_lay.addWidget(dist_split, 0, 0)
+hsplit.addWidget(right_col)
 
 # Resize and show window
 hsplit.setStretchFactor(0, 400)
@@ -444,6 +470,8 @@ def clear_meas():
 def measure_toggled(checked):
     vLine.setVisible(checked)
     hLine.setVisible(checked)
+    if checked:
+        amp_btn.setChecked(False)      # the in-plot drag belongs to Measure
     if not checked:
         drag_measure_hide()
     update_title_from_state()
@@ -782,6 +810,20 @@ def vb_drag_event(ev, axis=None):
             drag_measure_show(p0, p1)
             update_title_from_state()
         return
+    if (axis is None and ev.button() == pg.QtCore.Qt.LeftButton
+            and amp_btn.isChecked()):
+        # Amp mode takes over the in-plot left-drag: rubber-band a new time
+        # region for the amplitude histogram (pan is suspended; axis-strip
+        # zoom still works). A tiny span on release is a click: discard.
+        ev.accept()
+        p0 = vb.mapSceneToView(ev.buttonDownScenePos())
+        p1 = vb.mapSceneToView(ev.scenePos())
+        lo, hi = sorted((float(p0.x()), float(p1.x())))
+        if ev.isFinish():
+            amp_drag_finish(lo, hi)
+        else:
+            amp_drag_update(lo, hi)
+        return
     if axis is None or ev.button() != pg.QtCore.Qt.LeftButton:
         return _orig_vb_drag(ev, axis=axis)
     ev.accept()
@@ -897,30 +939,31 @@ def trace_label(index):
     return label
 
 
-def build_stitched(items):
-    """Concatenate (index, trace) items end-to-end on a continuous time axis.
+def build_stitched(entries):
+    """Concatenate cached (x, y, label, trace) entries end-to-end on a
+    continuous time axis.
 
     Each segment continues at the previous segment's end time using its own
     XInterval, so traces with different sampling rates or lengths mix fine.
-    Returns (x, y, seams, segments): seams holds the junction times between
-    consecutive segments (len(items) - 1 entries); segments holds
-    (x_start, x_end, 'SeriesLabel W# (T#)') per segment for the measure
-    cursor lookup.
+    The y arrays come from the last_data cache (each read from disk once);
+    the x axes are rebuilt from the running time. Returns
+    (x, y, seams, segments): seams holds the junction times between
+    consecutive segments (len(entries) - 1 entries); segments holds
+    (x_start, x_end, label) per segment for the measure cursor lookup.
     """
     xs = []
     ys = []
     seams = []
     segments = []
-    t = items[0][1].XStart
-    for index, trace in items:
-        data = bundle.data[list(index)]
-        n = len(data)
+    t = float(entries[0][0][0])
+    for x, y, label, trace in entries:
+        n = len(y)
         t0 = t
-        ys.append(data)
+        ys.append(y)
         xs.append(t + np.arange(n) * trace.XInterval)
         t += n * trace.XInterval
         seams.append(t)
-        segments.append((t0, t, trace_label(index)))
+        segments.append((t0, t, label))
     return np.concatenate(xs), np.concatenate(ys), seams[:-1], segments
 
 
@@ -932,19 +975,24 @@ def replot():
     trace nodes plot individually. Multi-selection plots the union
     (deduplicated) of all expanded traces.
     """
-    global cur_xunit, cur_yunit, last_snap, stitch_segments
+    global cur_xunit, cur_yunit, last_snap, stitch_segments, last_data
     plot.clear()
     legend.clear()
     data_tree.clear()
     clear_meas()
+    clear_amp_regions()
     add_crosshair()
     add_zoom_regions()
     add_readout()
+    add_detect_items()
     zoom_history.clear()
     stitch_segments = []
 
     selected = tree.selectedItems()
     if len(selected) < 1 or bundle is None:
+        last_data = []
+        run_detection()
+        amp_recompute()
         return
 
     # update data tree
@@ -958,17 +1006,25 @@ def replot():
         collect_traces(sel.index, sel.node, traces)
     items = sorted(traces.items())
 
+    # cache every displayed trace (raw arrays, one disk read each) for the
+    # analysis panel; plotting below reuses the cache
+    last_data = []
+    for index, trace in items:
+        data = bundle.data[list(index)]
+        time = np.linspace(trace.XStart, trace.XStart + trace.XInterval * (len(data)-1), len(data))
+        last_data.append((time, data, trace_label(index), trace))
+
     if len(items) > 20:
         legend.hide()
     else:
         legend.show()
 
     if stitch_btn.isChecked() and len(items) > 1:
-        index0, trace0 = items[0]
+        trace0 = items[0][1]
         plot.setLabels(bottom=('Time', trace0.XUnit), left=(trace0.Label, trace0.YUnit))
         cur_xunit = trace0.XUnit
         cur_yunit = trace0.YUnit
-        x, y, seams, seg_infos = build_stitched(items)
+        x, y, seams, seg_infos = build_stitched(last_data)
         stitch_segments = seg_infos
         plot.plot(x, y, pen=pg.mkPen(THEME['cycle'][0], width=1), name='stitched ×%d' % len(items))
         for t in seams:
@@ -976,15 +1032,17 @@ def replot():
                                    pen=pg.mkPen(THEME['seam'], width=1, style=pg.QtCore.Qt.DashLine))
             plot.getPlotItem().addItem(line, ignoreBounds=True)
     else:
-        for i, (index, trace) in enumerate(items):
+        for i, (x, y, label, trace) in enumerate(last_data):
             plot.setLabels(bottom=('Time', trace.XUnit), left=(trace.Label, trace.YUnit))
             cur_xunit = trace.XUnit
             cur_yunit = trace.YUnit
-            data = bundle.data[list(index)]
-            time = np.linspace(trace.XStart, trace.XStart + trace.XInterval * (len(data)-1), len(data))
-            plot.plot(time, data, pen=trace_pen(i, len(items)), name=trace_label(index))
+            plot.plot(x, y, pen=trace_pen(i, len(items)), name=label)
 
     fit_view()
+    if detect_btn.isChecked():
+        run_detection()
+    if amp_btn.isChecked():
+        amp_recompute()
 
 
 # replot when ever the user selects a new item
@@ -997,6 +1055,426 @@ def stitch_toggled(checked):
 
 
 stitch_btn.toggled.connect(stitch_toggled)
+
+
+# --- Distribution panel: amplitude histograms + threshold-band events --------
+#   Amp    checkable: left-drag in the plot adds time regions; the Amplitude
+#          tab shows the all-point histogram of the raw samples inside them.
+#   Detect checkable: a draggable horizontal band; what counts as an event
+#          is set by the mode (default: samples inside the band). The Events
+#          tab shows dwell / level histograms and highlights the events on
+#          the traces. Analysis always runs on the per-trace raw arrays in
+#          last_data (never on the stitched display curve) through the pure
+#          functions in heka/analysis.py.
+
+last_data = []           # (x, y, label, trace) of every displayed trace
+amp_regions = []         # committed time-region items
+_pending_region = None   # region currently being rubber-band dragged
+_evt_overlays = []       # event highlight curves in the main plot
+
+
+def _tint(hexcolor, alpha):
+    c = pg.QtGui.QColor(hexcolor)
+    c.setAlpha(alpha)
+    return pg.mkBrush(c)
+
+
+def analysis_segments(stride=1):
+    """(t, y) pairs of the displayed traces for heka.analysis.
+
+    Per trace on purpose: sweeps of one series share their time axis, so
+    concatenating them would fabricate events at the junctions.
+    """
+    segs = []
+    for x, y, label, trace in last_data:
+        if stride > 1:
+            x, y = x[::stride], y[::stride]
+        segs.append((x, y))
+    return segs
+
+
+def total_points():
+    return sum(len(y) for _, y, _, _ in last_data)
+
+
+# Detect band: two draggable lines + translucent fill; the region item is
+# re-attached by add_detect_items() after every plot.clear()
+band_region = pg.LinearRegionItem(values=(0.0, 1.0), orientation='horizontal',
+                                  movable=True, brush=_tint(THEME['band'], 60),
+                                  pen=pg.mkPen(THEME['band'], width=1))
+band_region.setZValue(-5)
+band_region.hide()
+
+
+def add_detect_items():
+    """Re-attach the Detect band to the plot (plot.clear() detaches it)."""
+    pi = plot.getPlotItem()
+    if band_region.scene() is None:
+        pi.addItem(band_region, ignoreBounds=True)
+    band_region.setVisible(detect_btn.isChecked())
+
+
+def make_region(lo, hi, k):
+    """Committed Amp region k: vertical band, edges draggable afterwards."""
+    color = THEME['cycle'][k % len(THEME['cycle'])]
+    region = pg.LinearRegionItem(values=(lo, hi), orientation='vertical',
+                                 movable=True, brush=_tint(color, 40),
+                                 pen=pg.mkPen(color, width=1))
+    region.setZValue(-8)
+    plot.getPlotItem().addItem(region, ignoreBounds=True)
+    region.sigRegionChanged.connect(amp_preview)
+    region.sigRegionChangeFinished.connect(amp_recompute)
+    return region
+
+
+def amp_drag_update(lo, hi):
+    global _pending_region
+    if _pending_region is None:
+        _pending_region = make_region(lo, hi, len(amp_regions))
+    else:
+        _pending_region.setRegion((lo, hi))
+
+
+def amp_drag_finish(lo, hi):
+    global _pending_region
+    total = vb.viewRange()[0][1] - vb.viewRange()[0][0]
+    if _pending_region is not None:
+        if hi - lo > 1e-9 * total:
+            amp_regions.append(_pending_region)
+        else:
+            plot.getPlotItem().removeItem(_pending_region)
+        _pending_region = None
+    amp_recompute()
+
+
+def clear_amp_regions():
+    global _pending_region
+    pi = plot.getPlotItem()
+    for r in ([_pending_region] if _pending_region is not None else []) + amp_regions:
+        if r.scene() is not None:
+            pi.removeItem(r)
+    amp_regions.clear()
+    _pending_region = None
+
+
+# -- Distribution panel widgets -------------------------------------------------
+
+sec_dist = Collapsible('Distribution')
+dist_tabs = pg.QtWidgets.QTabWidget()
+sec_dist.add_widget(dist_tabs)
+dist_split.addWidget(sec_dist)
+
+# Amplitude tab: one histogram per region, Y axis linked to the main plot so
+# a histogram peak sits at the same height as its current level in the trace
+amp_tab = pg.QtWidgets.QWidget()
+amp_lay = pg.QtWidgets.QVBoxLayout(amp_tab)
+amp_lay.setContentsMargins(4, 4, 4, 4)
+amp_lay.setSpacing(3)
+amp_ctrl = pg.QtWidgets.QHBoxLayout()
+amp_auto_bins = pg.QtWidgets.QCheckBox('auto bins')
+amp_auto_bins.setChecked(settings.value('amp/bins_auto', True, type=bool))
+amp_bins = NumericEdit(float(settings.value('amp/bins', 150.0, type=float)),
+                       8, 4096)
+amp_follow = pg.QtWidgets.QCheckBox('range = view Y')
+amp_follow.setChecked(settings.value('amp/follow', False, type=bool))
+for _w in (amp_auto_bins, pg.QtWidgets.QLabel('bins'), amp_bins, amp_follow):
+    amp_ctrl.addWidget(_w)
+amp_ctrl.addStretch(1)
+amp_lay.addLayout(amp_ctrl)
+amp_plot = pg.PlotWidget()
+amp_plot.getPlotItem().getViewBox().setYLink(vb)
+amp_lay.addWidget(amp_plot, 1)
+amp_stats = pg.QtWidgets.QLabel('')
+amp_stats.setWordWrap(True)
+amp_lay.addWidget(amp_stats)
+dist_tabs.addTab(amp_tab, 'Amplitude')
+
+# Events tab: dwell / level histograms side by side, params on top
+evt_tab = pg.QtWidgets.QWidget()
+evt_lay = pg.QtWidgets.QVBoxLayout(evt_tab)
+evt_lay.setContentsMargins(4, 4, 4, 4)
+evt_lay.setSpacing(3)
+evt_ctrl = pg.QtWidgets.QHBoxLayout()
+evt_mode = pg.QtWidgets.QComboBox()
+evt_mode.addItems(['inside', 'outside', 'below', 'above'])
+evt_mode.setCurrentText(settings.value('dist/mode', 'inside', type=str))
+evt_k = NumericEdit(float(settings.value('dist/k', 3.0, type=float)), 0.0, 1e4)
+evt_tmin = NumericEdit(float(settings.value('dist/t_min', 3.0, type=float)),
+                       0.0, 1e6)
+evt_merge = NumericEdit(float(settings.value('dist/merge', 0.0, type=float)),
+                        0.0, 1e4)
+evt_ccdf = pg.QtWidgets.QCheckBox('1-CDF (log-log)')
+evt_ccdf.setChecked(settings.value('dist/ccdf', False, type=bool))
+for _w in (pg.QtWidgets.QLabel('mode'), evt_mode,
+           pg.QtWidgets.QLabel('h = k·σ'), evt_k,
+           pg.QtWidgets.QLabel('t_min (pts)'), evt_tmin,
+           pg.QtWidgets.QLabel('merge (s)'), evt_merge, evt_ccdf):
+    evt_ctrl.addWidget(_w)
+evt_ctrl.addStretch(1)
+evt_lay.addLayout(evt_ctrl)
+evt_split = pg.QtWidgets.QSplitter(pg.QtCore.Qt.Horizontal)
+dwell_plot = pg.PlotWidget()
+dwell_plot.getPlotItem().setLogMode(x=True)
+level_plot = pg.PlotWidget()
+evt_split.addWidget(dwell_plot)
+evt_split.addWidget(level_plot)
+evt_split.setStretchFactor(0, 1)
+evt_split.setStretchFactor(1, 1)
+evt_lay.addWidget(evt_split, 1)
+evt_stats = pg.QtWidgets.QLabel('')
+evt_stats.setWordWrap(True)
+evt_lay.addWidget(evt_stats)
+dist_tabs.addTab(evt_tab, 'Events')
+
+
+# -- Analysis pipeline ------------------------------------------------------------
+
+def amp_values(r0, r1, stride):
+    """Raw samples of every displayed trace inside a time region."""
+    vals = []
+    for x, y, label, trace in last_data:
+        v = y[(x >= r0) & (x <= r1)]
+        if stride > 1:
+            v = v[::stride]
+        if v.size:
+            vals.append(v)
+    return vals
+
+
+def amp_recompute(full=True):
+    """Rebuild the Amplitude histograms from the committed regions.
+
+    All regions share one binning (edges from the pooled values) so the same
+    physical level lands in the same bin everywhere. full=False computes on
+    a strided subsample for live drags; release always recomputes in full.
+    """
+    pi = amp_plot.getPlotItem()
+    pi.clear()
+    if not (amp_btn.isChecked() and amp_regions):
+        amp_stats.setText('<span style="color:#999">Amp: enable, then '
+                          'left-drag in the plot to add time regions.</span>')
+        return
+    stride = 1 if full else max(1, total_points() // 200000)
+    regs = [r.getRegion() for r in amp_regions]
+    per_region = [amp_values(r0, r1, stride) for r0, r1 in regs]
+    pooled = [v for vals in per_region for v in vals]
+    if not pooled:
+        amp_stats.setText('regions cover no samples')
+        return
+    pooled = np.concatenate(pooled)
+    if amp_follow.isChecked():
+        rng = tuple(vb.viewRange()[1])
+    else:
+        rng = None
+    nbins = 'fd' if amp_auto_bins.isChecked() else int(round(amp_bins.value()))
+    edges = analysis.all_point_histogram(pooled, bins=nbins, value_range=rng)[0]
+
+    lines = []
+    maxc = 0.0
+    for k, ((r0, r1), vals) in enumerate(zip(regs, per_region)):
+        if not vals:
+            continue
+        v = np.concatenate(vals)
+        _, counts, under, over = analysis.all_point_histogram(
+            v, bins=edges)
+        frac = counts * 100.0 / max(1, v.size)
+        maxc = max(maxc, float(frac.max()))
+        color = THEME['cycle'][k % len(THEME['cycle'])]
+        pi.addItem(pg.BarGraphItem(
+            x0=np.zeros(len(frac)), x1=frac,
+            y0=edges[:-1], y1=edges[1:],
+            brush=_tint(color, 150), pen=pg.mkPen(color, width=1)))
+        p1, p99 = np.percentile(v, [1, 99])
+        lines.append(
+            '<span style="color:%s">#%d: N=%d  mean=%s  σ=%s  '
+            'p1..p99=%s .. %s  out-of-range=%d</span>'
+            % (color, k, v.size, fmt_si(float(v.mean()), cur_yunit),
+               fmt_si(float(v.std()), cur_yunit), fmt_si(float(p1), cur_yunit),
+               fmt_si(float(p99), cur_yunit), under + over))
+    amp_plot.setLabels(bottom='% of region samples', left=cur_yunit)
+    if maxc > 0:
+        pi.getViewBox().setXRange(0, maxc * 1.1, padding=0)
+    amp_stats.setText('<br>'.join(lines))
+
+
+def amp_preview():
+    amp_recompute(full=False)
+
+
+def update_event_hists(events):
+    """Redraw the Events tab: dwell histogram (log bins) or 1-CDF, plus the
+    absolute event-level histogram."""
+    dwell_pi = dwell_plot.getPlotItem()
+    level_pi = level_plot.getPlotItem()
+    dwell_pi.clear()
+    level_pi.clear()
+    if not len(events):
+        return
+    if evt_ccdf.isChecked():
+        sv = analysis.survival_function(events['dwell'])
+        if sv is not None:
+            dwell_pi.setLogMode(x=True, y=True)
+            dwell_pi.addItem(pg.PlotCurveItem(
+                sv[0], sv[1], pen=pg.mkPen(THEME['event'], width=2)))
+            dwell_plot.setLabels(bottom='dwell (s, log-log)', left='S(t) = 1-CDF')
+    else:
+        dwell_pi.setLogMode(x=True, y=False)
+        hist = analysis.log_histogram(events['dwell'])
+        if hist is not None:
+            edges, counts = hist
+            # stepMode='center' takes the bin EDGES (len = N+1) and draws
+            # each bar centered on its bin
+            dwell_pi.addItem(pg.PlotCurveItem(
+                edges, counts, stepMode='center',
+                pen=pg.mkPen(THEME['event'], width=1),
+                fillLevel=0, brush=_tint(THEME['event'], 120)))
+            dwell_plot.setLabels(bottom='dwell (s, log bins)', left='events')
+    hist = analysis.all_point_histogram(events['y_level'])
+    if hist is not None:
+        edges, counts, under, over = hist
+        level_pi.addItem(pg.BarGraphItem(
+            x0=edges[:-1], x1=edges[1:], y0=np.zeros(len(counts)), y1=counts,
+            brush=_tint(THEME['event'], 140), pen=pg.mkPen(THEME['event'], width=1)))
+        level_plot.setLabels(bottom='level (%s)' % cur_yunit, left='events')
+
+
+def run_detection(full=True):
+    """Threshold-band event detection: overlay on the traces + Events tab.
+
+    full=False runs on a strided subsample (live band drags); release
+    recomputes in full. Raises of heka.analysis (bad band vs hysteresis)
+    land in the stats label instead of a dialog.
+    """
+    global _evt_overlays
+    pi = plot.getPlotItem()
+    for it in _evt_overlays:
+        if it.scene() is not None:
+            pi.removeItem(it)
+    _evt_overlays = []
+    if not detect_btn.isChecked() or not last_data:
+        band_region.hide()
+        dwell_plot.getPlotItem().clear()
+        level_plot.getPlotItem().clear()
+        evt_stats.setText('<span style="color:#999">Detect: enable, then drag '
+                          'the teal band; what counts as an event depends on '
+                          'the mode (default: samples inside the band).</span>')
+        return
+    band_region.show()
+    lo, hi = band_region.getRegion()
+    stride = 1 if full else max(1, total_points() // 200000)
+    segs = analysis_segments(stride)
+    try:
+        res = analysis.detect_events_segments(
+            segs, mode=evt_mode.currentText(), lo=lo, hi=hi, h=None,
+            k=evt_k.value(), t_min=int(round(evt_tmin.value())),
+            merge_gap=evt_merge.value())
+    except ValueError as exc:
+        dwell_plot.getPlotItem().clear()
+        level_plot.getPlotItem().clear()
+        evt_stats.setText('<span style="color:%s">%s</span>'
+                          % (THEME['A'], exc))
+        return
+    events = res.events
+
+    # highlight the event stretches on the displayed traces (NaN outside
+    # events + connect='finite' breaks the line there)
+    for k, (x, y) in enumerate(segs):
+        ev = events[events['i_seg'] == k]
+        if not len(ev):
+            continue
+        mask = np.zeros(len(x), dtype=bool)
+        lo_i = np.searchsorted(x, ev['t_start'], side='left')
+        hi_i = np.searchsorted(x, ev['t_end'], side='right')
+        for a, b in zip(lo_i, hi_i):
+            mask[a:max(b, a + 1)] = True
+        curve = pg.PlotDataItem(x, np.where(mask, y, np.nan),
+                                pen=pg.mkPen(THEME['event'], width=2),
+                                connect='finite')
+        pi.addItem(curve, ignoreBounds=True)
+        _evt_overlays.append(curve)
+
+    update_event_hists(events)
+    dur = sum(float(x[-1] - x[0]) for x, _ in segs if len(x) > 1)
+    if len(events) and dur > 0:
+        txt = ('N=%d events   rate=%s   dwell: median=%s  mean=%s   '
+               'level: median=%s'
+               % (len(events), fmt_si(len(events) / dur, 'Hz'),
+                  fmt_si(float(np.median(events['dwell'])), 's'),
+                  fmt_si(float(events['dwell'].mean()), 's'),
+                  fmt_si(float(np.median(events['y_level'])), cur_yunit)))
+    else:
+        txt = 'no events inside the band'
+    notes = ['h=%s (= %.4g·σ, σ=%s)'
+             % (fmt_si(res.h, cur_yunit), res.h / res.sigma if res.sigma else 0,
+                fmt_si(res.sigma, cur_yunit))]
+    if res.boundary_discarded:
+        notes.append('%d boundary event(s) discarded (entry or exit not '
+                     'observed)' % res.boundary_discarded)
+    evt_stats.setText(txt + '<br>' + '<br>'.join(notes))
+
+
+def clear_analysis():
+    """Clear Amp regions, event overlays and panel contents. The Detect band
+    stays while Detect is on (it is a mode control, not a result)."""
+    clear_amp_regions()
+    run_detection()
+    amp_recompute()
+
+
+def detect_toggled(checked):
+    settings.setValue('dist/enabled', checked)
+    if checked and last_data:
+        pooled = np.concatenate([y[::max(1, len(y) // 100000)]
+                                 for _, y, _, _ in last_data])
+        p25, p75 = np.percentile(pooled, [25, 75])
+        if p75 > p25:
+            band_region.setRegion((float(p25), float(p75)))
+    run_detection()
+
+
+def amp_toggled(checked):
+    settings.setValue('amp/enabled', checked)
+    if checked:
+        measure_btn.setChecked(False)  # the in-plot drag belongs to Amp
+    if not checked:
+        clear_amp_regions()
+    amp_recompute()
+
+
+# Debounced refresh of the amplitude histogram while the user zooms the main
+# view with "range = view Y" on
+_follow_timer = pg.QtCore.QTimer()
+_follow_timer.setSingleShot(True)
+_follow_timer.setInterval(150)
+_follow_timer.timeout.connect(amp_recompute)
+
+
+def _main_range_changed(*_):
+    if amp_btn.isChecked() and amp_follow.isChecked() and amp_regions:
+        _follow_timer.start()
+
+
+band_region.sigRegionChanged.connect(amp_preview)
+band_region.sigRegionChangeFinished.connect(run_detection)
+evt_mode.currentIndexChanged.connect(lambda *_: run_detection())
+evt_k._cb = lambda *_: run_detection()
+evt_tmin._cb = lambda *_: run_detection()
+evt_merge._cb = lambda *_: run_detection()
+evt_ccdf.toggled.connect(lambda *_: run_detection())
+amp_auto_bins.toggled.connect(lambda *_: amp_recompute())
+amp_bins._cb = lambda *_: amp_recompute()
+amp_follow.toggled.connect(lambda *_: amp_recompute())
+vb.sigRangeChanged.connect(_main_range_changed)
+clear_btn.clicked.connect(clear_analysis)
+amp_btn.toggled.connect(amp_toggled)
+detect_btn.toggled.connect(detect_toggled)
+
+
+# initial hints + persisted on/off state
+run_detection()
+amp_recompute()
+amp_btn.setChecked(settings.value('amp/enabled', False, type=bool))
+detect_btn.setChecked(settings.value('dist/enabled', False, type=bool))
 
 # load Heka's demo bundle if it is present
 demo = 'DemoV9Bundle.dat'
@@ -1016,7 +1494,13 @@ def _restore_layout():
         vsplit.setSizes([int(s) for s in vs])
     else:
         vsplit.setSizes((380, 200, 150))
-    for key, sec in (('tree', sec_tree), ('nano', sec_nano), ('info', sec_info)):
+    ds = settings.value('layout/distsplit')
+    if ds:
+        dist_split.setSizes([int(s) for s in ds])
+    else:
+        dist_split.setSizes((600, 220))
+    for key, sec in (('tree', sec_tree), ('nano', sec_nano), ('info', sec_info),
+                     ('dist', sec_dist)):
         sec.set_collapsed(settings.value('layout/collapsed/' + key, False, type=bool))
 
 
@@ -1026,8 +1510,18 @@ _restore_layout()
 def _save_layout():
     settings.setValue('layout/hsplit', list(hsplit.sizes()))
     settings.setValue('layout/vsplit', list(vsplit.sizes()))
-    for key, sec in (('tree', sec_tree), ('nano', sec_nano), ('info', sec_info)):
+    settings.setValue('layout/distsplit', list(dist_split.sizes()))
+    for key, sec in (('tree', sec_tree), ('nano', sec_nano), ('info', sec_info),
+                     ('dist', sec_dist)):
         settings.setValue('layout/collapsed/' + key, sec.is_collapsed())
+    settings.setValue('dist/mode', evt_mode.currentText())
+    settings.setValue('dist/k', evt_k.value())
+    settings.setValue('dist/t_min', evt_tmin.value())
+    settings.setValue('dist/merge', evt_merge.value())
+    settings.setValue('dist/ccdf', evt_ccdf.isChecked())
+    settings.setValue('amp/bins_auto', amp_auto_bins.isChecked())
+    settings.setValue('amp/bins', amp_bins.value())
+    settings.setValue('amp/follow', amp_follow.isChecked())
 
 
 app.aboutToQuit.connect(_save_layout)

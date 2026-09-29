@@ -9,7 +9,9 @@
 | `reader.py` | 底层解析库（`Bundle` 类），解析 `.pul` 元数据树 + 懒读取 `.dat` 原始数据 |
 | `utils.py` | 高层封装 `HekaFile` 类：按标签/序号取数、单位换算 |
 | `nanopore.py` | 纳米孔计算：KCl/NaCl/LiCl 电导率表（25 °C）+ 孔径公式 |
-| `browser.py` | 交互式 GUI 浏览器（pyqtgraph）：浏览、测量、孔径计算 |
+| `analysis.py` | 时间序列分析库（纯 numpy）：阈值带+滞回事件检测、直方图、存活函数；GUI 与 notebook 共用同一入口 |
+| `test_analysis.py` | `analysis.py` 的无头测试（合成数据，`python3 test_analysis.py` 直接跑） |
+| `browser.py` | 交互式 GUI 浏览器（pyqtgraph）：浏览、测量、分布分析、孔径计算 |
 | `launcher.py` + `heka_browser.spec` | PyInstaller 打包入口与配置（见第 6 节） |
 | `build_mac.sh` / `build_windows.bat` / `build_linux.sh` | 三平台一键构建脚本 |
 
@@ -62,7 +64,7 @@ python heka/browser.py        # 任意工作目录直接运行也可以，已内
 
 > Stitch 拼接会把选中数据完整复制一份：Series 级（几十 MB）无压力；整 Group（GB 级）内存会翻倍，建议按 Series 拼接。拼接曲线上测量（十字线 / A-B 差值）照常可用，y 读数是真实采样点，`dy/dt` 跨拼接段无物理意义。
 
-9. **Measure 测量** / **Nano 计算器面板**：见 1.3、1.4 节
+9. **Measure 测量** / **Nano 计算器面板** / **Distribution 分布面板**：见 1.3–1.5 节
 
 ### 1.3 Measure 测量模式
 
@@ -123,7 +125,33 @@ d = calculate_pore_diameter(1e-9, 0.1,        # I (A), V (V)
                             sigma=sigma, thickness=20e-9)   # → 5.241 nm
 ```
 
-### 1.5 性能说明
+### 1.5 Distribution 分布面板（Amp / Detect）
+
+按钮行的 **Amp** 与 **Detect** 是两个开关按钮，结果都显示在**主图下方的 `▾ Distribution` 面板**（可折叠，*Amplitude* / *Events* 两个标签页；折叠状态、分割位置与全部参数跨会话记忆）。分析永远基于**每条曲线的原始采样数组**（per-trace，不是拼接后的显示曲线），由纯 numpy 库 `analysis.py` 完成——GUI 与脚本共用同一入口：
+
+```python
+from heka.analysis import detect_events, detect_events_segments, all_point_histogram
+```
+
+**Amp — 幅度直方图（选段看分布）**
+
+- 开启后在图区内**左键拖拽**框选一个时间区域（可框多个，颜色轮换，边缘可拖动微调）；**Amplitude 页**显示每个区域内原始采样点数值的直方图（横轴 = 占区域样本的 %，纵轴 = 电流/电压，**与主图 Y 轴联动**——直方图峰与主图上的电流水平线同高）
+- 多区域共用同一套 bin 边界（按合并数据计算），同一物理水平不会错位；bin 数默认 Freedman–Diaconis（稳健 IQR，clamp 32–256），取消 `auto bins` 可手动指定
+- bin 范围默认取稳健百分位 p0.5–p99.5；勾选 `range = view Y` 后跟随主图 Y 缩放（拉近哪个电流水平就算哪段，放大时 bin 自动变细）；范围外样本计入 out-of-range 统计，**不静默丢弃**
+- 面板底部逐区域统计：N / mean / σ / p1–p99 / out-of-range
+- Amp 与 Measure 互斥（图区左键拖拽归属其一，轴条缩放不受影响）；**Clear** 同时清除测量标记与区域
+
+**Detect — 事件检测（阈值带 + 滞回）**
+
+- 开启后主图出现**青色水平阈值带**（两条线可任意拖动）。默认 `inside` 模式：**带内即事件**——不假定基线，信号进入带内算事件开始、离开带算结束；`outside`（带外=事件，基线在带中、上下双向尖峰）、`below` / `above`（单阈值的向下阻断 / 向上尖峰）在模式下拉切换
+- **抗噪声拆分三件套**：`h = k·σ` 滞回——退出阈值向带外偏移 k 倍噪声 σ（σ 由数据自动稳健估计），带沿 ±h 内的噪声抖动不会把一个事件拆成两个；`t_min`（采样点数）去掉毛刺；`merge (s)` 把间隔小于该值的事件合并回一个（0 = 关闭）
+- 检出的事件段在主图上**绿色高亮**；**Events 页**：左图 = dwell 持续时间直方图（**对数 bin**，每十进制 10 格；勾选 `1-CDF (log-log)` 切换成存活函数，用于判幂律 / 多指数）+ 右图 = 事件内绝对平均电平直方图
+- 面板底部统计：事件数 / 速率 / dwell 中位数·均值 / 电平中位数 / 实际使用的 h 与 σ；**边界事件**（事件跨越数据首尾、进入或退出未被观测到）自动丢弃并在统计中注明数量
+- 拖动阈值带实时刷新（拖动中用抽样预览、松手全量重算），调参所见即所得
+
+> Stitch 拼接只是显示行为：同一 Series 的多个 sweep 时间轴重叠，拼接检测会产生假事件，因此检测/直方图始终按原始 per-trace 数据运行，Events 页直接看合并后的结果即可。
+
+### 1.6 性能说明
 
 已开启 `peak` 模式降采样 + 视口裁剪：选整个 Group（数百条、全文件 460 MB）也能流畅缩放，且降采样不丢失 spike 尖峰。注意选 Group 会把全部数据载入内存（约 1.6 GB），日常按 Series/Sweep 浏览更轻量。
 
