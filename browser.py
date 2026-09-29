@@ -18,7 +18,6 @@ THEME = {
     'seam':       '#B0B0B0',                    # stitch seam dashed lines
     'band':       '#76B7B2',                    # Detect threshold band (teal)
     'event':      '#59A14F',                    # event highlight / event hists
-    'mask':       '#FFFFFF',                    # out-of-band range mask
     # Tableau 10 for <= 10 traces; Tableau 20 (deep+light shades) for <= 20;
     # beyond that a muted golden-ratio hue walk -- distinguishable, no neon
     'cycle':      ['#4E79A7', '#F28E2B', '#E15759', '#76B7B2', '#59A14F',
@@ -1213,46 +1212,12 @@ band_region.setZValue(-5)
 band_region.hide()
 
 
-_band_mask_top = pg.QtWidgets.QGraphicsRectItem(0, 0, 1, 1)
-_band_mask_bot = pg.QtWidgets.QGraphicsRectItem(0, 0, 1, 1)
-for _r in (_band_mask_top, _band_mask_bot):
-    _r.setBrush(_tint(THEME['mask'], 215))    # washes the trace outside the band
-    _r.setPen(pg.mkPen(None))
-    _r.setZValue(10)
-    _r.hide()
-
-
-def _update_band_mask(*_):
-    """White-out the plot areas outside the Y-range band while detection is
-    armed and the band is placed; hidden when cleared / inactive / dragging
-    an unplaced band."""
-    on = _evt_active() and _band_placed and band_region.isVisible()
-    vr = vb.viewRange()
-    x0, x1 = vr[0]
-    y0, y1 = vr[1]
-    if on:
-        lo, hi = band_region.getRegion()
-        _band_mask_top.setRect(pg.QtCore.QRectF(x0, hi, x1 - x0,
-                                                max(0.0, y1 - hi)))
-        _band_mask_bot.setRect(pg.QtCore.QRectF(x0, y0, x1 - x0,
-                                                max(0.0, lo - y0)))
-        _band_mask_top.show()
-        _band_mask_bot.show()
-    else:
-        _band_mask_top.hide()
-        _band_mask_bot.hide()
-
-
 def add_detect_items():
-    """Re-attach the Detect band and range mask (plot.clear() detaches)."""
+    """Re-attach the Detect band to the plot (plot.clear() detaches it)."""
     pi = plot.getPlotItem()
     if band_region.scene() is None:
         pi.addItem(band_region, ignoreBounds=True)
-    for _m in (_band_mask_top, _band_mask_bot):
-        if _m.scene() is None:
-            pi.addItem(_m, ignoreBounds=True)
     band_region.setVisible(_evt_active())
-    _update_band_mask()
 
 
 _amp_syncing = False
@@ -1760,7 +1725,6 @@ def run_detection(full=True):
             evt_stats.setText('<span style="color:#999">切到本标签页即启用检测：按住 Shift '
                               '在主图内<b>竖向拖拽</b>画出 Y 范围带（或拖带子边线、输入数值），'
                               '信号进入带内=事件开始、离开带=事件结束；切走后自动停止。</span>')
-        _update_band_mask()
         return
     band_region.show()
     lo, hi = band_region.getRegion()
@@ -1850,7 +1814,6 @@ def run_detection(full=True):
                      '（多为 spike 顶部碎片链）'
                      % (res.duty_discarded, evt_duty.value() * 100))
     evt_stats.setText(txt + '<br>' + '<br>'.join(notes))
-    _update_band_mask()
 
 
 def _evt_clear():
@@ -2166,7 +2129,6 @@ def _main_range_changed(*_):
 # drags of the lines reach the commit.
 def _band_region_changed(*_):
     _sync_fields_from_band()          # field echo only -- no computation
-    _update_band_mask()               # trivial visual update, follows live
 
 
 def _band_region_commit(*_):
@@ -2175,7 +2137,6 @@ def _band_region_commit(*_):
 
 
 band_region.sigRegionChanged.connect(_band_region_changed)
-band_region.sigRegionChanged.connect(_update_band_mask)
 band_region.sigRegionChangeFinished.connect(_band_region_commit)
 evt_mode.currentIndexChanged.connect(lambda *_: run_detection())
 evt_k._cb = lambda *_: run_detection()
@@ -2204,7 +2165,6 @@ ruler_b.sigPositionChanged.connect(_update_ruler)
 amp_clear_btn.clicked.connect(
     lambda: (clear_amp_regions(), _refresh_region_list(), amp_recompute()))
 vb.sigRangeChanged.connect(_main_range_changed)
-vb.sigRangeChanged.connect(_update_band_mask)
 clear_btn.clicked.connect(clear_analysis)
 dist_tabs.currentChanged.connect(_dist_view_changed)
 sec_dist.btn.clicked.connect(_dist_view_changed)

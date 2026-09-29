@@ -24,7 +24,7 @@
 - 「启用检测」**不持久化**（幽灵状态事故：持久化 + 哨兵带 (0,1)A → 每次启动全图铺绿）。`_band_placed` 标志：启用时无数据则等 replot 有数据后再补放带。
 - **Stitch 联动检测**：`_stitch_active` 时 `analysis_segments` 返回拼接连续轴单段（跨 sweep 态驻留才能完整检出），否则按 per-trace。`_prepped`/`_stitch_cache` 以 `(_data_stamp, head_s, smooth_ms)` 为键缓存（`_data_stamp` 在 replot 重绑 last_data 时自增，**勿用 id()**——地址复用会撞缓存）；拼接轴累加必须用**抽稀后的实测间距**（用 `trace.XInterval` 会把时间轴压缩 w 倍）。平滑 = 不相交窗中位数压缩（`dist/smooth`），spike 密集两态数据配 1–2 ms + duty_min=0.5 用；`t_min` 单位 ms（`dist/t_min_ms`），内部换算原始点数再除以窗宽。
 - overlay 曲线有点数护栏（全量 >2M 采样时按 stride 抽稀，仅视觉层；检测/统计永远全分辨率）；事件数 >5 万或**带内样本占比 >50%**（`analysis.in_band_fraction`，带子圈基线的信号）时头条红字警告。
-- Events 直方图：dwell **默认线性 bin**（`dist/dwell_log` 勾选才对数），1-CDF 恒 log-log；level 轴用 SI 前缀显示单位（native/f 换算）；**两个直方图各一对常驻 A/B 测量线**（红/蓝，`_update_evt_meas` 读数行，level 值 ×f 回原生再格式化避免 ppA 双前缀）；带子放置时主图**带外白遮罩**（`_band_mask_top/bot`，THEME['mask']，`_update_band_mask` 随带子/视图更新，`ignoreBounds` 不参与自适配）；**拖带子零检测**（`_band_region_changed` 只回显），松手 `sigRegionChangeFinished` 才全量计算+标记。
+- Events 直方图：dwell **默认线性 bin**（`dist/dwell_log` 勾选才对数），1-CDF 恒 log-log；level 轴用 SI 前缀显示单位（native/f 换算）；**两个直方图各一对常驻 A/B 测量线**（红/蓝，`_update_evt_meas` 读数行，level 值 ×f 回原生再格式化避免 ppA 双前缀）；**拖带子零检测**（`_band_region_changed` 只回显），松手 `sigRegionChangeFinished` 才全量计算+标记。
 
 ## 测试（无正式测试套件）
 
