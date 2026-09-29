@@ -802,10 +802,12 @@ def vb_drag_event(ev, axis=None):
             update_title_from_state()
         return
     if (axis is None and ev.button() == pg.QtCore.Qt.LeftButton
-            and amp_add_btn.isChecked()):
-        # Amp mode takes over the in-plot left-drag: rubber-band a new time
-        # region for the amplitude histogram (pan is suspended; axis-strip
-        # zoom still works). A tiny span on release is a click: discard.
+            and amp_add_btn.isChecked()
+            and (ev.modifiers() & pg.QtCore.Qt.ShiftModifier)):
+        # Amp selection gesture: Shift + left-drag rubber-bands a new time
+        # region for the amplitude histogram. Plain drag always pans and
+        # axis-strip drag always zooms -- selection never hijacks them.
+        # A tiny span on release is a click: discard.
         ev.accept()
         p0 = vb.mapSceneToView(ev.buttonDownScenePos())
         p1 = vb.mapSceneToView(ev.scenePos())
@@ -814,6 +816,20 @@ def vb_drag_event(ev, axis=None):
             amp_drag_finish(lo, hi)
         else:
             amp_drag_update(lo, hi)
+        return
+    if (axis is None and ev.button() == pg.QtCore.Qt.LeftButton
+            and evt_enable.isChecked()
+            and (ev.modifiers() & pg.QtCore.Qt.ShiftModifier)):
+        # Events selection gesture: Shift + left-drag draws the Y-range band
+        # vertically (live preview; a vertical extent below 3% of the view
+        # height is treated as an accidental drag and ignored on release).
+        ev.accept()
+        p0 = vb.mapSceneToView(ev.buttonDownScenePos())
+        p1 = vb.mapSceneToView(ev.scenePos())
+        if ev.isFinish():
+            band_drag_finish(p0.y(), p1.y())
+        else:
+            band_drag_update(p0.y(), p1.y())
         return
     if axis is None or ev.button() != pg.QtCore.Qt.LeftButton:
         return _orig_vb_drag(ev, axis=axis)
@@ -967,7 +983,8 @@ def replot():
     (deduplicated) of all expanded traces.
     """
     global cur_xunit, cur_yunit, last_snap, stitch_segments, last_data
-    global _stitch_active, _stitch_cache, _prep_cache
+    global _stitch_active, _stitch_cache, _prep_cache, _stitched_display
+    global _data_stamp
     plot.clear()
     legend.clear()
     data_tree.clear()
@@ -982,6 +999,8 @@ def replot():
     _stitch_active = False
     _stitch_cache = None
     _prep_cache = None
+    _stitched_display = None
+    _data_stamp += 1
 
     selected = tree.selectedItems()
     if len(selected) < 1 or bundle is None:
@@ -1004,6 +1023,7 @@ def replot():
     # cache every displayed trace (raw arrays, one disk read each) for the
     # analysis panel; plotting below reuses the cache
     last_data = []
+    _data_stamp += 1
     for index, trace in items:
         data = bundle.data[list(index)]
         time = np.linspace(trace.XStart, trace.XStart + trace.XInterval * (len(data)-1), len(data))
@@ -1022,6 +1042,7 @@ def replot():
         x, y, seams, seg_infos = build_stitched(last_data)
         stitch_segments = seg_infos
         _stitch_active = True
+        _stitched_display = (x, y)
         plot.plot(x, y, pen=pg.mkPen(THEME['cycle'][0], width=1), name='stitched ×%d' % len(items))
         for t in seams:
             line = pg.InfiniteLine(pos=t, angle=90, movable=False,
@@ -1070,8 +1091,10 @@ amp_regions = []         # committed time-region items
 _pending_region = None   # region currently being rubber-band dragged
 _evt_overlays = []       # event highlight curves in the main plot
 _stitch_active = False   # Stitch on -> detection runs on the continuous axis
-_stitch_cache = None     # (head_s, smooth_ms, (x, y)) analysis axis for stitch
-_prep_cache = None       # (head_s, smooth_ms, [(x, y, label, trace)]) per trace
+_stitch_cache = None     # (_data_stamp, head_s, smooth_ms, (x, y)) stitch axis
+_prep_cache = None       # (_data_stamp, head_s, smooth_ms, [...]) per trace
+_stitched_display = None # raw stitched (x, y) shown in the main plot
+_data_stamp = 0          # bumped on every last_data rebind (cache keys)
 _band_placed = False     # Y-range band placed (auto or by the user)?
 
 
@@ -1102,7 +1125,7 @@ def analysis_segments(stride=1, head_s=0.0, smooth_ms=0.0):
     prepped = _prepped(head_s, smooth_ms)
     if _stitch_active and prepped:
         if (_stitch_cache is None
-                or _stitch_cache[:3] != (id(last_data), head_s, smooth_ms)):
+                or _stitch_cache[:3] != (_data_stamp, head_s, smooth_ms)):
             xs, ys, t = [], [], None
             for x, y, label, trace in prepped:
                 if t is None:
@@ -1113,7 +1136,7 @@ def analysis_segments(stride=1, head_s=0.0, smooth_ms=0.0):
                 xs.append(t + np.arange(len(y)) * dt)
                 ys.append(y)
                 t += len(y) * dt
-            _stitch_cache = (id(last_data), head_s, smooth_ms,
+            _stitch_cache = (_data_stamp, head_s, smooth_ms,
                              (np.concatenate(xs), np.concatenate(ys)))
         x, y = _stitch_cache[3]
         if stride > 1:
@@ -1129,9 +1152,9 @@ def analysis_segments(stride=1, head_s=0.0, smooth_ms=0.0):
 
 def _prepped(head_s, smooth_ms):
     """Per-trace detection arrays: transient head sliced, optional median
-    decimation applied; cached per (last_data, head_s, smooth_ms)."""
+    decimation applied; cached per (data version, head_s, smooth_ms)."""
     global _prep_cache
-    key = (id(last_data), head_s, smooth_ms)
+    key = (_data_stamp, head_s, smooth_ms)
     if _prep_cache is None or _prep_cache[:3] != key:
         out = []
         for x, y, label, trace in last_data:
@@ -1175,7 +1198,8 @@ def make_region(lo, hi, k):
     """Committed Amp region k: vertical band, edges draggable afterwards."""
     color = THEME['cycle'][k % len(THEME['cycle'])]
     region = pg.LinearRegionItem(values=(lo, hi), orientation='vertical',
-                                 movable=True, brush=_tint(color, 40),
+                                 movable=amp_add_btn.isChecked(),
+                                 brush=_tint(color, 40),
                                  pen=pg.mkPen(color, width=1))
     region.setZValue(-8)
     plot.getPlotItem().addItem(region, ignoreBounds=True)
@@ -1232,15 +1256,20 @@ amp_lay.setSpacing(3)
 amp_ctrl = pg.QtWidgets.QHBoxLayout()
 amp_add_btn = pg.QtWidgets.QPushButton('添加区域')
 amp_add_btn.setCheckable(True)
-amp_add_btn.setToolTip('开启后在主图内左键拖拽框选一个时间区域（可与 Measure 互斥）')
+amp_add_btn.setToolTip('开启后按住 Shift 在主图内左键横向拖拽框选一个时间区域\n'
+                       '（普通拖拽 = 平移，轴条拖拽 = 缩放）')
 amp_clear_btn = pg.QtWidgets.QPushButton('清空区域')
+amp_ruler_btn = pg.QtWidgets.QPushButton('峰标尺')
+amp_ruler_btn.setCheckable(True)
+amp_ruler_btn.setToolTip('在直方图上放置两条可拖动的竖线 A/B，\n'
+                         '实时读取两个峰的位置与它们的差 Δ')
 amp_auto_bins = pg.QtWidgets.QCheckBox('auto bins')
 amp_auto_bins.setChecked(settings.value('amp/bins_auto', True, type=bool))
 amp_bins = NumericEdit(float(settings.value('amp/bins', 150.0, type=float)),
                        8, 4096)
 amp_follow = pg.QtWidgets.QCheckBox('range = view Y')
 amp_follow.setChecked(settings.value('amp/follow', False, type=bool))
-for _w in (amp_add_btn, amp_clear_btn, amp_auto_bins,
+for _w in (amp_add_btn, amp_clear_btn, amp_ruler_btn, amp_auto_bins,
            pg.QtWidgets.QLabel('bins'), amp_bins, amp_follow):
     amp_ctrl.addWidget(_w)
 amp_ctrl.addStretch(1)
@@ -1251,12 +1280,54 @@ amp_list_lay.setContentsMargins(0, 0, 0, 0)
 amp_list_lay.setSpacing(1)
 amp_lay.addWidget(amp_list_widget)
 amp_plot = pg.PlotWidget()
-amp_plot.getPlotItem().getViewBox().setYLink(vb)
 amp_lay.addWidget(amp_plot, 1)
+amp_ruler_lbl = pg.QtWidgets.QLabel('')
+amp_lay.addWidget(amp_ruler_lbl)
 amp_stats = pg.QtWidgets.QLabel('')
 amp_stats.setWordWrap(True)
 amp_lay.addWidget(amp_stats)
 dist_tabs.addTab(amp_tab, 'Amplitude')
+
+# Peak ruler: two draggable vertical markers on the amplitude histogram for
+# reading peak positions and their difference (dI between two states)
+ruler_a = pg.InfiniteLine(angle=90, movable=True,
+                          pen=pg.mkPen(THEME['A'], width=1))
+ruler_b = pg.InfiniteLine(angle=90, movable=True,
+                          pen=pg.mkPen(THEME['B'], width=1))
+for _r in (ruler_a, ruler_b):
+    _r.hide()
+
+
+def _attach_ruler():
+    pi = amp_plot.getPlotItem()
+    for _r in (ruler_a, ruler_b):
+        if _r.scene() is None:
+            pi.addItem(_r, ignoreBounds=True)
+    on = amp_ruler_btn.isChecked()
+    ruler_a.setVisible(on)
+    ruler_b.setVisible(on)
+
+
+def _update_ruler(*_):
+    if not amp_ruler_btn.isChecked():
+        return
+    _, prefix = _yunit_scale()
+    unit_s = '%s%s' % (prefix, cur_yunit)
+    amp_ruler_lbl.setText(
+        '<b>A</b> = %s &nbsp; <b>B</b> = %s &nbsp; <b>Δ = %s</b>'
+        % (fmt_si(ruler_a.value(), unit_s), fmt_si(ruler_b.value(), unit_s),
+           fmt_si(abs(ruler_b.value() - ruler_a.value()), unit_s)))
+
+
+def amp_ruler_toggled(checked):
+    _attach_ruler()
+    if checked:
+        x0, x1 = amp_plot.getPlotItem().getViewBox().viewRange()[0]
+        if not x0 <= ruler_a.value() <= x1:
+            ruler_a.setValue(x0 + 0.3 * (x1 - x0))
+        if not x0 <= ruler_b.value() <= x1:
+            ruler_b.setValue(x0 + 0.7 * (x1 - x0))
+    _update_ruler()
 
 # Events tab: laid out in workflow order -- enable, Y range, edge rules,
 # then the headline result and the histograms
@@ -1292,8 +1363,8 @@ evt_mode = pg.QtWidgets.QComboBox()
 evt_mode.addItems(['inside', 'outside', 'below', 'above'])
 evt_mode.setCurrentText(settings.value('dist/mode', 'inside', type=str))
 evt_k = NumericEdit(float(settings.value('dist/k', 3.0, type=float)), 0.0, 1e4)
-evt_tmin = NumericEdit(float(settings.value('dist/t_min', 3.0, type=float)),
-                       0.0, 1e6)
+evt_tmin = NumericEdit(float(settings.value('dist/t_min_ms', 0.1, type=float)),
+                       0.0, 1e4)
 evt_merge = NumericEdit(float(settings.value('dist/merge', 0.0, type=float)),
                         0.0, 1e4)
 evt_head = NumericEdit(float(settings.value('dist/head', 10.0, type=float)),
@@ -1306,7 +1377,7 @@ evt_ccdf = pg.QtWidgets.QCheckBox('1-CDF (log-log)')
 evt_ccdf.setChecked(settings.value('dist/ccdf', False, type=bool))
 for _w in (pg.QtWidgets.QLabel('<b>边沿判定</b>  模式'), evt_mode,
            pg.QtWidgets.QLabel('滞回 k·σ'), evt_k,
-           pg.QtWidgets.QLabel('最短 (点)'), evt_tmin,
+           pg.QtWidgets.QLabel('最短 (ms)'), evt_tmin,
            pg.QtWidgets.QLabel('合并 (s)'), evt_merge,
            pg.QtWidgets.QLabel('忽略开头 (ms)'), evt_head,
            pg.QtWidgets.QLabel('检测平滑 (ms)'), evt_smooth,
@@ -1320,7 +1391,8 @@ evt_mode.setToolTip('inside = 带内即事件（默认，不假定基线）\n'
                     'above = y > lo 即事件（向上尖峰）')
 evt_k.setToolTip('事件结束要求信号明确离开带宽 k·σ（σ 自动估计），\n'
                  '防止噪声在带沿反复进出把一个事件拆成多个；0 = 关闭滞回')
-evt_tmin.setToolTip('短于该采样点数（原始采样率计）的事件丢弃（去毛刺）')
+evt_tmin.setToolTip('短于该时长的事件丢弃（去毛刺）。\n'
+                    'spike 穿带碎片 ~0.1–0.3 ms；两态驻留通常 ≥ 数 ms')
 evt_merge.setToolTip('间隔小于该值的事件合并回一个（用于重连被 spike 打断的态驻留）。\n'
                      '⚠ 过大会把高频 spike 的顶部碎片串接成假长事件——\n'
                      'spike 密集的数据请改用「检测平滑」+「带内占比」')
@@ -1328,8 +1400,7 @@ evt_head.setToolTip('忽略每条曲线开头这段时间（电容充放电瞬�
                     'Stitch 模式下每条 sweep 的开头都会被切掉')
 evt_smooth.setToolTip('检测前把每条曲线按该窗宽做中位数压缩：\n'
                       '比窗窄的 spike 被压掉，秒级电平台完整保留。\n'
-                      'spike 密集的两态数据建议 1–2 ms；0 = 关闭。\n'
-                      '「最短 (点)」始终按原始采样率计，无需换算')
+                      'spike 密集的两态数据建议 1–2 ms；0 = 关闭')
 evt_duty.setToolTip('合并后事件跨度内、真正在带内的时间占比低于该值即丢弃。\n'
                     'spike 顶部碎片链占比 ~3%，真实态驻留 >50% —— 一刀分开')
 
@@ -1361,7 +1432,17 @@ dist_tabs.addTab(evt_tab, 'Events')
 # -- Analysis pipeline ------------------------------------------------------------
 
 def amp_values(r0, r1, stride):
-    """Raw samples of every displayed trace inside a time region."""
+    """Raw samples of the displayed data inside a time region.
+
+    With Stitch on the regions live on the continuous stitched axis, so the
+    values come from the cached stitched raw arrays; otherwise per trace.
+    """
+    if _stitch_active and _stitched_display is not None:
+        x, y = _stitched_display
+        v = y[(x >= r0) & (x <= r1)]
+        if stride > 1:
+            v = v[::stride]
+        return [v] if v.size else []
     vals = []
     for x, y, label, trace in last_data:
         v = y[(x >= r0) & (x <= r1)]
@@ -1381,13 +1462,15 @@ def amp_recompute(full=True):
     """
     pi = amp_plot.getPlotItem()
     pi.clear()
+    _attach_ruler()
     if not (amp_add_btn.isChecked() and amp_regions):
         if amp_add_btn.isChecked():
-            amp_stats.setText('<span style="color:#999">已启用：在主图内<b>左键拖拽</b>'
-                              '框选一个时间区域，直方图与统计会出现在这里。</span>')
+            amp_stats.setText('<span style="color:#999">已启用：按住 <b>Shift</b> 在主图内'
+                              '<b>横向拖拽</b>框选时间区域；普通拖拽 = 平移，'
+                              '轴条拖拽 = 缩放。</span>')
         else:
-            amp_stats.setText('<span style="color:#999">添加区域：开启「添加区域」后在'
-                              '主图内左键拖拽框选时间区域，看这段采样点数值的分布。</span>')
+            amp_stats.setText('<span style="color:#999">添加区域：开启后按住 Shift 在'
+                              '主图内左键横向拖拽框选时间区域，看这段采样点数值的分布。</span>')
         return
     stride = 1 if full else max(1, total_points() // 200000)
     regs = [r.getRegion() for r in amp_regions]
@@ -1406,6 +1489,8 @@ def amp_recompute(full=True):
 
     lines = []
     maxc = 0.0
+    f, prefix = _yunit_scale()
+    unit_s = '%s%s' % (prefix, cur_yunit)
     for k, ((r0, r1), vals) in enumerate(zip(regs, per_region)):
         if not vals:
             continue
@@ -1415,9 +1500,10 @@ def amp_recompute(full=True):
         frac = counts * 100.0 / max(1, v.size)
         maxc = max(maxc, float(frac.max()))
         color = THEME['cycle'][k % len(THEME['cycle'])]
+        # vertical histogram: X = current (display unit), Y = % of samples
         pi.addItem(pg.BarGraphItem(
-            x0=np.zeros(len(frac)), x1=frac,
-            y0=edges[:-1], y1=edges[1:],
+            x0=edges[:-1] / f, x1=edges[1:] / f,
+            y0=np.zeros(len(frac)), y1=frac,
             brush=_tint(color, 150), pen=pg.mkPen(color, width=1)))
         p1, p99 = np.percentile(v, [1, 99])
         lines.append(
@@ -1426,10 +1512,12 @@ def amp_recompute(full=True):
             % (color, k, v.size, fmt_si(float(v.mean()), cur_yunit),
                fmt_si(float(v.std()), cur_yunit), fmt_si(float(p1), cur_yunit),
                fmt_si(float(p99), cur_yunit), under + over))
-    amp_plot.setLabels(bottom='% of region samples', left=cur_yunit)
+    amp_plot.setLabels(bottom=unit_s, left='% of region samples')
     if maxc > 0:
-        pi.getViewBox().setXRange(0, maxc * 1.1, padding=0)
+        pi.getViewBox().setYRange(0, maxc * 1.1, padding=0)
+    pi.getViewBox().setXRange(edges[0] / f, edges[-1] / f, padding=0)
     amp_stats.setText('<br>'.join(lines))
+    _update_ruler()
 
 
 def amp_preview():
@@ -1502,13 +1590,11 @@ def run_detection(full=True):
     lo, hi = band_region.getRegion()
     head_s = evt_head.value() * 1e-3
     smooth_ms = evt_smooth.value()
-    # 「最短 (点)」按原始采样率计；平滑压缩后检测序列变稀，需要换算
-    w = 1
-    if last_data and smooth_ms > 0:
-        dt0 = float(last_data[0][3].XInterval)
-        if dt0 > 0:
-            w = max(1, int(round(smooth_ms * 1e-3 / dt0)))
-    t_min_dec = max(1, int(round(evt_tmin.value() / w)))
+    # 最短 (ms) -> 原始采样点数；平滑压缩后检测序列变稀，再除以窗宽
+    dt0 = float(last_data[0][3].XInterval) if last_data else 0.0
+    t_min_pts = max(1, int(round(evt_tmin.value() * 1e-3 / dt0))) if dt0 > 0 else 1
+    w = max(1, int(round(smooth_ms * 1e-3 / dt0))) if (dt0 > 0 and smooth_ms > 0) else 1
+    t_min_dec = max(1, int(round(t_min_pts / w)))
     total = total_points()
     stride = 1 if full else max(1, total // 200000)
     segs = analysis_segments(stride, head_s=head_s, smooth_ms=smooth_ms)
@@ -1560,9 +1646,15 @@ def run_detection(full=True):
                                               fmt_si(len(events) / dur, 'Hz'))
     else:
         head = '<b>0 个事件</b>'
+    frac = analysis.in_band_fraction(segs, evt_mode.currentText(), lo, hi)
+    if frac is not None and frac > 0.5:
+        head += ('<br><span style="color:%s">信号 %.0f%% 的时间在带内：带子圈住了'
+                 '基线/主态，inside 模式会把它整体判成事件——请把带子收窄到'
+                 '单一电平台</span>' % (THEME['A'], frac * 100))
     if len(events) > 50000:
-        head += ('<br><span style="color:%s">事件数异常大：带子可能贴着基线/噪声，'
-                 '请调整 Y 范围</span>' % THEME['A'])
+        head += ('<br><span style="color:%s">事件数异常大（%d）：建议开启'
+                 '「检测平滑」1–2 ms、增大「最短 (ms)」，并检查 Y 范围是否'
+                 '圈住了基线</span>' % (THEME['A'], len(events)))
     evt_headline.setText(head)
     if len(events):
         txt = ('dwell: median=%s  mean=%s   level: median=%s'
@@ -1613,6 +1705,7 @@ def _place_band():
 
 
 def detect_toggled(checked):
+    band_region.setMovable(checked)     # band edges only draggable when on
     if checked:
         if sec_dist.is_collapsed():
             sec_dist.set_collapsed(False)
@@ -1622,11 +1715,13 @@ def detect_toggled(checked):
 
 def amp_add_toggled(checked):
     if checked:
-        measure_btn.setChecked(False)   # the in-plot drag belongs to Amp
+        measure_btn.setChecked(False)   # keep one armed selection mode
         if sec_dist.is_collapsed():
             sec_dist.set_collapsed(False)
-    else:
-        clear_amp_regions()
+    # Disarming keeps the regions (analysis state -- remove them with
+    # [清空区域] instead); their handles simply freeze.
+    for r in amp_regions:               # handles only movable while armed
+        r.setMovable(checked)
     amp_recompute()
 
 
@@ -1677,31 +1772,32 @@ def _remove_region(r):
 
 _band_syncing = False
 
-_yunit_cache = None   # (id(last_data), factor, si_prefix)
+_yunit_cache = None   # (_data_stamp, factor, si_prefix)
 
 
 def _yunit_scale():
     """(factor, prefix) for the Y-range fields: an SI prefix chosen so the
     band numbers are readable (an A-native trace is edited in pA)."""
     global _yunit_cache
-    if _yunit_cache is None or _yunit_cache[0] != id(last_data):
-        f, prefix = 1.0, ''
+    if _yunit_cache is None or _yunit_cache[0] != _data_stamp:
+        e, prefix = 0, ''
         if last_data:
             y0 = last_data[0][1]
             ref = float(np.nanmedian(np.abs(y0[:min(100000, len(y0))])))
             if ref > 0 and np.isfinite(ref):
                 for _ in range(9):
-                    if abs(ref / f) >= 1 and abs(ref / f) < 1000:
+                    r = abs(ref) / 10.0 ** e
+                    if 1 <= r < 1000:
                         break
-                    nf = f * 1e3 if abs(ref / f) >= 1000 else f * 1e-3
-                    if nf == f:
-                        break
-                    f, prefix = nf, {1e-12: 'p', 1e-9: 'n', 1e-6: 'u',
-                                     1e-3: 'm', 1.0: '', 1e3: 'k',
-                                     1e6: 'M'}.get(f, prefix)
-                prefix = {1e-12: 'p', 1e-9: 'n', 1e-6: 'u', 1e-3: 'm',
-                          1.0: '', 1e3: 'k', 1e6: 'M'}.get(f, '')
-        _yunit_cache = (id(last_data), f, prefix)
+                    e += 3 if r >= 1000 else -3
+                f = 10.0 ** e
+                prefix = {-12: 'p', -9: 'n', -6: 'u', -3: 'm',
+                          0: '', 3: 'k', 6: 'M'}.get(e, '')
+            else:
+                f = 1.0
+        else:
+            f = 1.0
+        _yunit_cache = (_data_stamp, f, prefix)
     return _yunit_cache[1], _yunit_cache[2]
 
 
@@ -1731,6 +1827,31 @@ def _sync_band_from_fields(*_):
         run_detection()
     finally:
         _band_syncing = False
+
+
+def band_drag_update(y0, y1):
+    """Shift+drag Events gesture: live preview of the Y-range band."""
+    lo, hi = sorted((float(y0), float(y1)))
+    band_region.setRegion((lo, hi))
+    band_region.show()
+
+
+def band_drag_finish(y0, y1):
+    """Commit the drawn band: extents below 3% of the view height are
+    treated as accidental drags and ignored (the previous band stays)."""
+    global _band_placed, _band_syncing
+    view_h = vb.viewRange()[1][1] - vb.viewRange()[1][0]
+    lo, hi = sorted((float(y0), float(y1)))
+    if hi - lo <= 0.03 * view_h:
+        return
+    _band_syncing = True
+    try:
+        band_region.setRegion((lo, hi))
+    finally:
+        _band_syncing = False
+    _band_placed = True
+    _sync_fields_from_band()
+    run_detection()
 
 
 # -- Event table + CSV export -----------------------------------------------------
@@ -1842,6 +1963,11 @@ evt_csv_btn.clicked.connect(_export_events_csv)
 amp_auto_bins.toggled.connect(lambda *_: amp_recompute())
 amp_bins._cb = lambda *_: amp_recompute()
 amp_follow.toggled.connect(lambda *_: amp_recompute())
+amp_ruler_btn.toggled.connect(amp_ruler_toggled)
+ruler_a.sigPositionChangeFinished.connect(_update_ruler)
+ruler_b.sigPositionChangeFinished.connect(_update_ruler)
+ruler_a.sigPositionChanged.connect(_update_ruler)
+ruler_b.sigPositionChanged.connect(_update_ruler)
 amp_clear_btn.clicked.connect(
     lambda: (clear_amp_regions(), _refresh_region_list(), amp_recompute()))
 vb.sigRangeChanged.connect(_main_range_changed)
@@ -1898,7 +2024,7 @@ def _save_layout():
         settings.setValue('layout/collapsed/' + key, sec.is_collapsed())
     settings.setValue('dist/mode', evt_mode.currentText())
     settings.setValue('dist/k', evt_k.value())
-    settings.setValue('dist/t_min', evt_tmin.value())
+    settings.setValue('dist/t_min_ms', evt_tmin.value())
     settings.setValue('dist/merge', evt_merge.value())
     settings.setValue('dist/head', evt_head.value())
     settings.setValue('dist/smooth', evt_smooth.value())

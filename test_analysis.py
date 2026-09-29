@@ -228,6 +228,17 @@ def test_t_head_ignores_transient():
     assert abs(keep.events[0]['t_start'] - 100 * 5e-5) < 3 * 5e-5
 
 
+def test_in_band_fraction():
+    n = 1000
+    y = np.full(n, -100.0)
+    y[:200] = 25.0                       # 20% of samples at 25
+    segs = [(_ramp(n), y)]
+    assert abs(analysis.in_band_fraction(segs, 'inside', 10.0, 40.0) - 0.2) < 1e-9
+    assert abs(analysis.in_band_fraction(segs, 'outside', 10.0, 40.0) - 0.8) < 1e-9
+    assert analysis.in_band_fraction(segs, 'below', 10.0, 40.0) == 1.0
+    assert analysis.in_band_fraction([], 'inside', 0.0, 1.0) is None
+
+
 def test_validation_errors():
     y = np.zeros(100)
     t = _ramp(100)

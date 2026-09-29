@@ -13,7 +13,7 @@ import numpy as np
 
 __all__ = ['noise_sigma', 'detect_events', 'detect_events_segments',
            'all_point_histogram', 'log_histogram', 'survival_function',
-           'fd_bin_count', 'EventResult', 'EVENT_DTYPE']
+           'fd_bin_count', 'in_band_fraction', 'EventResult', 'EVENT_DTYPE']
 
 # One detected event: boundary times (sub-sample interpolated), duration,
 # absolute mean level inside the event (first/last sample trimmed) and the
@@ -262,6 +262,32 @@ def detect_events_segments(segments, **kwargs):
     return EventResult(pooled,
                        float(np.sum(h_vals) / n), float(np.sum(sig_vals) / n),
                        boundary, duty_discarded)
+
+
+def in_band_fraction(segments, mode, lo, hi):
+    """Fraction of samples satisfying the mode's event condition, averaged
+    over segments (None when there is no data or the mode is unknown).
+
+    A fraction above ~50% means the band encloses the resting level, so an
+    inside-mode detection flags the baseline itself as events -- the GUI
+    uses this to warn about a band drawn over the baseline.
+    """
+    fracs = []
+    for _, y in segments:
+        y = np.asarray(y, dtype=float)
+        if mode == 'inside':
+            m = (y >= lo) & (y <= hi)
+        elif mode == 'outside':
+            m = (y < lo) | (y > hi)
+        elif mode == 'below':
+            m = y < hi
+        elif mode == 'above':
+            m = y > lo
+        else:
+            return None
+        if y.size:
+            fracs.append(float(np.mean(m)))
+    return float(np.mean(fracs)) if fracs else None
 
 
 def fd_bin_count(y, lo=32, hi=256):
