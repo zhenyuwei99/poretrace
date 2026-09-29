@@ -15,9 +15,11 @@
 - 左列三个可折叠区块（`sec_tree` / `sec_nano` / `sec_info`）在垂直 QSplitter 里，折叠靠 `setMaximumHeight` 技巧（QSplitter 会保留隐藏控件的空间）。右侧是 `dist_split`（主图 + `sec_dist` Distribution 面板）。
 - 树节点文本是路径式编号 `G0 S26 W3 T0`（对应图例 `(G#g S#w W#)` 和 `rec.get(N)`）；选中/绘图逻辑全部走 `item.index`，不要解析节点文本。
 - 分析库 `analysis.py` **纯 numpy、零 Qt**（GUI / notebook / 测试共用）；GUI 侧 `replot()` 把每条显示曲线的原始数组缓存进 `last_data = [(x, y, label, trace)]`，检测/直方图**永远按 per-trace 跑**（sweep 时间轴重叠，绝不能在拼接曲线上检测）。
-- Distribution 面板控件全在 tab 内（顶部按钮行无相关按钮）：Amplitude = 「添加区域」开关 + 区域列表（色块+×）+「峰标尺」（A/B 可拖竖线 + Δ 读数，直方图上量两峰间距）；Events = 「启用检测」开关 + Y 范围 lo/hi 数值框（**单位自动取 SI 前缀**，`_yunit_scale` 按 `_data_stamp` 缓存，`_band_syncing` 防回环）+ 事件表（双击跳转）/CSV。
-- **手势契约**：轴条拖拽/滚轮 = 缩放；图区普通拖拽 = 平移（永远不被接管）；选择一律 **Shift+拖拽**——Amplitude 激活 = 横向时间区域、Events 启用 = 竖向画带（竖向幅度 <3% 视图高忽略）；区域/带子边缘手柄仅对应功能激活时 movable。Measure 仍是普通拖拽（开启时接管）。
-- Amplitude 直方图**竖直方向**（X=电流·SI 前缀，Y=占比%）；Stitch 开启时区域取数走 `_stitched_display` 拼接原始数组（区域坐标在拼接轴上）。取消「添加区域」保留区域仅冻结手柄。
+- Distribution 面板**打开 tab 即激活对应功能**（无任何启用按钮）：Amplitude tab = Shift+横向拖拽选段 + 区域列表（色块+×）+「峰标尺」（A/B 可拖竖线 + Δ 读数）；Events tab = 检测自动开启 + Y 范围 lo/hi 数值框（**单位自动取 SI 前缀**，`_yunit_scale` 按 `_data_stamp` 缓存，`_band_syncing` 防回环）+ 事件表（双击跳转）/CSV。**切走自动清理**（Amp 删区域、Events 停检测清高亮）；面板折叠 = 两者都停；`dist/tab` 记住上次 tab。
+- **手势契约**：轴条拖拽/滚轮 = 缩放；图区普通拖拽 = 平移（永远不被接管）；选择一律 **Shift+拖拽**——Amplitude tab 激活 = 横向时间区域、Events tab 激活 = 竖向画带（竖向幅度 <3% 视图高忽略）；区域/带子边缘手柄仅对应 tab 激活时 movable。Measure 仍是普通拖拽（开启时接管），与 Shift 选择天然共存、无互斥。
+- Amplitude 直方图**竖直方向**（X=电流·SI 前缀，Y=占比%）；Stitch 开启时区域取数走 `_stitched_display` 拼接原始数组（区域坐标在拼接轴上）。
+- **NumericEdit 的 `commit_on`**：参数字段全部 `'finish'`（回车/失焦才触发 cb）——`textChanged` 即时回调曾是带子拖动/bins 键入卡顿的根因（setText→cb→全量重算循环）；程序化回显用 `set_value_quiet` 或受 `_band_syncing` 守卫。
+- **LinearRegionItem 陷阱**：程序化 `setRegion` 会同时发出 `sigRegionChanged` **和** `sigRegionChangeFinished`——所有 handler 必须用 `_band_syncing`/`_amp_syncing` 守卫，否则画带/自动放带的每一步移动都触发全量重算。拖带子的防抖预览：`sigRegionChanged` → 150ms 防抖抽稀预览，`sigRegionChangeFinished`（松手）→ 全量。
 - 事件带**自动放置必须放尾部（事件侧）**：`detect_toggled` 比较上/下尾取 [p75,p99] 或 [p1,p25]——inside 模式带子放基线上会把半条曲线判成事件（G0 S19 绿色冲刷事故的根因）。事件边界插值 frac 夹取 [0,1]（`analysis._cross_time`），否则滞回缓冲区退出会外推出**负 dwell**。
 - 「启用检测」**不持久化**（幽灵状态事故：持久化 + 哨兵带 (0,1)A → 每次启动全图铺绿）。`_band_placed` 标志：启用时无数据则等 replot 有数据后再补放带。
 - **Stitch 联动检测**：`_stitch_active` 时 `analysis_segments` 返回拼接连续轴单段（跨 sweep 态驻留才能完整检出），否则按 per-trace。`_prepped`/`_stitch_cache` 以 `(_data_stamp, head_s, smooth_ms)` 为键缓存（`_data_stamp` 在 replot 重绑 last_data 时自增，**勿用 id()**——地址复用会撞缓存）；拼接轴累加必须用**抽稀后的实测间距**（用 `trace.XInterval` 会把时间轴压缩 w 倍）。平滑 = 不相交窗中位数压缩（`dist/smooth`），spike 密集两态数据配 1–2 ms + duty_min=0.5 用；`t_min` 单位 ms（`dist/t_min_ms`），内部换算原始点数再除以窗宽。
@@ -28,7 +30,7 @@
 - 快速语法门：`python3 -m py_compile <file>`。
 - 分析库测试：`python3 test_analysis.py`（合成数据，确定性，无需 GUI/pytest）。
 - GUI 冒烟测试模式：`QT_QPA_PLATFORM=offscreen`；exec `browser.py` 源码并把 `if sys.flags.interactive == 0:` 替换为 `if False:`（跳过事件循环），然后直接调用模块全局里的函数/控件。
-- **QSettings('heka','browser') 跨运行持久化**（`stitch`、`last_dir`、`layout/hsplit`、`layout/vsplit`、`layout/distsplit`、`layout/collapsed/*`、`dist/*`（mode/k/t_min/merge/head/smooth/duty/ccdf，**不含启用开关**）、`amp/bins*`、`amp/follow`，测试和真实 .app 都会写）。断言默认布局/状态前必须先 `settings.clear()`/`remove(...)`，且要在 **exec 之前** clear（模块级 setChecked 会触发 toggled 处理器写回）。
+- **QSettings('heka','browser') 跨运行持久化**（`stitch`、`last_dir`、`layout/hsplit`、`layout/vsplit`、`layout/distsplit`、`layout/collapsed/*`、`dist/*`（mode/tab/t_min_ms/k/merge/head/smooth/duty/ccdf）、`amp/bins*`、`amp/follow`，测试和真实 .app 都会写）。断言默认布局/状态前必须先 `settings.clear()`/`remove(...)`，且要在 **exec 之前** clear（模块级 setChecked/setCurrentIndex 会触发处理器写回）。
 - 现成的完整冒烟脚本在 `/var/folders/ts/jr156kps24x69kvjj0fkmp580000gn/T/opencode/`（临时目录，丢了就按上述模式重建）：`smoke_test.py`（树编号、折叠布局+持久化、Measure A/B+拖拽测距、Nano 自动填充、单位、主题、Stitch、百分位拟合）和 `dist_smoke.py`（添加区域+区域列表、启用检测+Y 范围双向同步+SI 单位、尾部自动放带、Stitch 联动跨缝事件、duty 过滤碎片链、事件表+CSV、滞回报错路径、互斥、持久化差异；注入 last_data 需带 `XInterval` stub，改 last_data 后依赖 `_prep_cache` 按 `id(last_data)` 自动失效）。测试读数断言注意：TextItem/QLabel 渲染 HTML，**`.text()` 返回源码字符串安全**，TextItem 的 `toPlainText()` 连续空格会折叠、不要原样比较。
 
 ## pyqtgraph 0.14 陷阱

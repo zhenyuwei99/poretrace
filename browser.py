@@ -461,8 +461,8 @@ def clear_meas():
 def measure_toggled(checked):
     vLine.setVisible(checked)
     hLine.setVisible(checked)
-    if checked:
-        amp_add_btn.setChecked(False)  # the in-plot drag belongs to Measure
+    # no exclusivity needed any more: Measure owns plain drag, the
+    # analysis tabs own Shift+drag -- they can be on at the same time
     if not checked:
         drag_measure_hide()
     update_title_from_state()
@@ -576,14 +576,21 @@ class NumericEdit(pg.QtWidgets.QLineEdit):
       float whenever it changes
     - invalid text keeps the last valid value; editingFinished rewrites the
       field to the valid formatted value
+    - commit_on: 'edit' fires change_cb on every keystroke; 'finish' fires
+      it only on Enter / focus loss -- parameter fields use 'finish' so
+      typing (and programmatic setText from live updates) never triggers a
+      recomputation mid-input
     """
 
-    def __init__(self, value, minimum, maximum, change_cb=None):
+    def __init__(self, value, minimum, maximum, change_cb=None,
+                 commit_on='edit'):
         super().__init__(self._fmt(value))
         self._min = float(minimum)
         self._max = float(maximum)
         self._cb = change_cb
+        self._commit_on = commit_on
         self._valid = float(value)
+        self._committed = float(value)
         self._normalizing = False
         self.textChanged.connect(self._on_text_changed)
         self.editingFinished.connect(self._on_editing_finished)
@@ -594,6 +601,16 @@ class NumericEdit(pg.QtWidgets.QLineEdit):
 
     def value(self):
         return self._valid
+
+    def set_value_quiet(self, v):
+        """Programmatic update: refresh the text without firing change_cb."""
+        self._valid = float(v)
+        self._committed = self._valid
+        self.setText(self._fmt(self._valid))
+
+    def commit(self):
+        """Force the editingFinished path (tests / programmatic commit)."""
+        self._on_editing_finished()
 
     def _parse(self):
         text = (self.text().replace('，', '.').replace('。', '.').replace('．', '.'))
@@ -616,7 +633,8 @@ class NumericEdit(pg.QtWidgets.QLineEdit):
         v = min(max(v, self._min), self._max)
         if v != self._valid:
             self._valid = v
-            if self._cb is not None:
+            if self._commit_on == 'edit' and self._cb is not None:
+                self._committed = v
                 self._cb(v)
 
     def _on_editing_finished(self):
@@ -624,6 +642,10 @@ class NumericEdit(pg.QtWidgets.QLineEdit):
         if v is not None:
             self._valid = min(max(v, self._min), self._max)
         self.setText(self._fmt(self._valid))
+        if (self._commit_on == 'finish' and self._cb is not None
+                and self._valid != self._committed):
+            self._committed = self._valid
+            self._cb(self._valid)
 
     def focusInEvent(self, ev):
         super().focusInEvent(ev)
@@ -802,7 +824,7 @@ def vb_drag_event(ev, axis=None):
             update_title_from_state()
         return
     if (axis is None and ev.button() == pg.QtCore.Qt.LeftButton
-            and amp_add_btn.isChecked()
+            and _amp_active()
             and (ev.modifiers() & pg.QtCore.Qt.ShiftModifier)):
         # Amp selection gesture: Shift + left-drag rubber-bands a new time
         # region for the amplitude histogram. Plain drag always pans and
@@ -818,7 +840,7 @@ def vb_drag_event(ev, axis=None):
             amp_drag_update(lo, hi)
         return
     if (axis is None and ev.button() == pg.QtCore.Qt.LeftButton
-            and evt_enable.isChecked()
+            and _evt_active()
             and (ev.modifiers() & pg.QtCore.Qt.ShiftModifier)):
         # Events selection gesture: Shift + left-drag draws the Y-range band
         # vertically (live preview; a vertical extent below 3% of the view
@@ -1056,12 +1078,10 @@ def replot():
             plot.plot(x, y, pen=trace_pen(i, len(items)), name=label)
 
     fit_view()
-    if evt_enable.isChecked():
-        if not _band_placed:
-            _place_band()          # enabled before loading: place now
-        run_detection()
-    if amp_add_btn.isChecked():
-        amp_recompute()
+    if _evt_active() and not _band_placed:
+        _place_band()
+    run_detection()
+    amp_recompute()
 
 
 # replot when ever the user selects a new item
@@ -1127,15 +1147,16 @@ def analysis_segments(stride=1, head_s=0.0, smooth_ms=0.0):
         if (_stitch_cache is None
                 or _stitch_cache[:3] != (_data_stamp, head_s, smooth_ms)):
             xs, ys, t = [], [], None
-            for x, y, label, trace in prepped:
+            for x, y, label, trace, n_full in prepped:
+                # place each sweep on the same timeline as the displayed
+                # stitch: advance by the FULL sweep duration (head slicing
+                # only hides samples, it must not compress the axis)
                 if t is None:
-                    t = float(x[0]) if len(x) else 0.0
-                # spacing of the (possibly decimated) prepped arrays
-                dt = float(np.mean(np.diff(x))) if len(x) > 1 \
-                    else float(trace.XInterval)
-                xs.append(t + np.arange(len(y)) * dt)
+                    t = float(trace.XStart)
+                dt = float(trace.XInterval)
+                xs.append(t + (x - float(trace.XStart)))
                 ys.append(y)
-                t += len(y) * dt
+                t += n_full * dt
             _stitch_cache = (_data_stamp, head_s, smooth_ms,
                              (np.concatenate(xs), np.concatenate(ys)))
         x, y = _stitch_cache[3]
@@ -1143,7 +1164,7 @@ def analysis_segments(stride=1, head_s=0.0, smooth_ms=0.0):
             x, y = x[::stride], y[::stride]
         return [(x, y)]
     segs = []
-    for x, y, label, trace in prepped:
+    for x, y, label, trace, n_full in prepped:
         if stride > 1:
             x, y = x[::stride], y[::stride]
         segs.append((x, y))
@@ -1152,12 +1173,15 @@ def analysis_segments(stride=1, head_s=0.0, smooth_ms=0.0):
 
 def _prepped(head_s, smooth_ms):
     """Per-trace detection arrays: transient head sliced, optional median
-    decimation applied; cached per (data version, head_s, smooth_ms)."""
+    decimation applied; cached per (data version, head_s, smooth_ms).
+    n_full = the ORIGINAL sample count, so the stitch accumulation can
+    advance by full sweep durations while the arrays stay sliced."""
     global _prep_cache
     key = (_data_stamp, head_s, smooth_ms)
     if _prep_cache is None or _prep_cache[:3] != key:
         out = []
         for x, y, label, trace in last_data:
+            n_full = len(y)
             dt = float(trace.XInterval)
             k = int(round(head_s / dt)) if dt > 0 else 0
             if k:
@@ -1168,7 +1192,7 @@ def _prepped(head_s, smooth_ms):
                 y = np.median(y[:m].reshape(-1, w), axis=1)
                 x = x[:m].reshape(-1, w).mean(axis=1)     # window centres
             if len(y):
-                out.append((x, y, label, trace))
+                out.append((x, y, label, trace, n_full))
         _prep_cache = key + (out,)
     return _prep_cache[3]
 
@@ -1191,29 +1215,46 @@ def add_detect_items():
     pi = plot.getPlotItem()
     if band_region.scene() is None:
         pi.addItem(band_region, ignoreBounds=True)
-    band_region.setVisible(evt_enable.isChecked())
+    band_region.setVisible(_evt_active())
+
+
+_amp_syncing = False
+
+
+def _amp_region_changed(*_):
+    if not _amp_syncing:
+        amp_preview()                 # strided live preview
+
+
+def _amp_region_commit(*_):
+    if not _amp_syncing:              # programmatic setRegion: skip
+        amp_recompute()
 
 
 def make_region(lo, hi, k):
-    """Committed Amp region k: vertical band, edges draggable afterwards."""
+    """Committed Amp region k: vertical band, edges draggable while the
+    Amplitude tab is active (regions only exist while it is)."""
     color = THEME['cycle'][k % len(THEME['cycle'])]
     region = pg.LinearRegionItem(values=(lo, hi), orientation='vertical',
-                                 movable=amp_add_btn.isChecked(),
-                                 brush=_tint(color, 40),
+                                 movable=True, brush=_tint(color, 40),
                                  pen=pg.mkPen(color, width=1))
     region.setZValue(-8)
     plot.getPlotItem().addItem(region, ignoreBounds=True)
-    region.sigRegionChanged.connect(amp_preview)
-    region.sigRegionChangeFinished.connect(amp_recompute)
+    region.sigRegionChanged.connect(_amp_region_changed)
+    region.sigRegionChangeFinished.connect(_amp_region_commit)
     return region
 
 
 def amp_drag_update(lo, hi):
-    global _pending_region
+    global _pending_region, _amp_syncing
     if _pending_region is None:
         _pending_region = make_region(lo, hi, len(amp_regions))
     else:
-        _pending_region.setRegion((lo, hi))
+        _amp_syncing = True           # rubber-band preview: no recomputes
+        try:
+            _pending_region.setRegion((lo, hi))
+        finally:
+            _amp_syncing = False
 
 
 def amp_drag_finish(lo, hi):
@@ -1254,10 +1295,6 @@ amp_lay = pg.QtWidgets.QVBoxLayout(amp_tab)
 amp_lay.setContentsMargins(4, 4, 4, 4)
 amp_lay.setSpacing(3)
 amp_ctrl = pg.QtWidgets.QHBoxLayout()
-amp_add_btn = pg.QtWidgets.QPushButton('添加区域')
-amp_add_btn.setCheckable(True)
-amp_add_btn.setToolTip('开启后按住 Shift 在主图内左键横向拖拽框选一个时间区域\n'
-                       '（普通拖拽 = 平移，轴条拖拽 = 缩放）')
 amp_clear_btn = pg.QtWidgets.QPushButton('清空区域')
 amp_ruler_btn = pg.QtWidgets.QPushButton('峰标尺')
 amp_ruler_btn.setCheckable(True)
@@ -1266,10 +1303,10 @@ amp_ruler_btn.setToolTip('在直方图上放置两条可拖动的竖线 A/B，\n
 amp_auto_bins = pg.QtWidgets.QCheckBox('auto bins')
 amp_auto_bins.setChecked(settings.value('amp/bins_auto', True, type=bool))
 amp_bins = NumericEdit(float(settings.value('amp/bins', 150.0, type=float)),
-                       8, 4096)
+                       8, 4096, commit_on='finish')
 amp_follow = pg.QtWidgets.QCheckBox('range = view Y')
 amp_follow.setChecked(settings.value('amp/follow', False, type=bool))
-for _w in (amp_add_btn, amp_clear_btn, amp_ruler_btn, amp_auto_bins,
+for _w in (amp_clear_btn, amp_ruler_btn, amp_auto_bins,
            pg.QtWidgets.QLabel('bins'), amp_bins, amp_follow):
     amp_ctrl.addWidget(_w)
 amp_ctrl.addStretch(1)
@@ -1337,18 +1374,17 @@ evt_lay.setContentsMargins(4, 4, 4, 4)
 evt_lay.setSpacing(2)
 
 evt_ctrl0 = pg.QtWidgets.QHBoxLayout()
-evt_enable = pg.QtWidgets.QCheckBox('启用检测')
-evt_enable.setToolTip('在主图上放置青色 Y 范围带：信号进入带内=事件开始，离开带=事件结束')
-_evt_hint = pg.QtWidgets.QLabel('绿色 = 判定为事件的采样段；带子应圈住事件电流水平，不要圈基线')
+_evt_hint = pg.QtWidgets.QLabel('本页已激活：Shift+竖向拖拽画出 Y 范围带（普通拖拽 = 平移，'
+                                '轴条拖拽 = 缩放）；绿色 = 判定为事件的采样段；'
+                                '带子圈住事件电流水平，不要圈基线')
 _evt_hint.setStyleSheet('color:#999;')
-evt_ctrl0.addWidget(evt_enable)
 evt_ctrl0.addWidget(_evt_hint)
 evt_ctrl0.addStretch(1)
 evt_lay.addLayout(evt_ctrl0)
 
 evt_ctrl1 = pg.QtWidgets.QHBoxLayout()          # workflow step 1: the Y range
-evt_lo = NumericEdit(0.0, -1e6, 1e6)
-evt_hi = NumericEdit(1.0, -1e6, 1e6)
+evt_lo = NumericEdit(0.0, -1e6, 1e6, commit_on='finish')
+evt_hi = NumericEdit(1.0, -1e6, 1e6, commit_on='finish')
 evt_ylab = pg.QtWidgets.QLabel('(%s)' % cur_yunit)
 evt_lo.setToolTip('Y 范围下沿，单位自动取可读的 SI 前缀（如 pA），与图上带子双向同步')
 for _w in (pg.QtWidgets.QLabel('<b>Y 范围</b>  lo'), evt_lo,
@@ -1362,47 +1398,73 @@ evt_ctrl2 = pg.QtWidgets.QHBoxLayout()          # workflow step 2: edge rules
 evt_mode = pg.QtWidgets.QComboBox()
 evt_mode.addItems(['inside', 'outside', 'below', 'above'])
 evt_mode.setCurrentText(settings.value('dist/mode', 'inside', type=str))
-evt_k = NumericEdit(float(settings.value('dist/k', 3.0, type=float)), 0.0, 1e4)
+evt_k = NumericEdit(float(settings.value('dist/k', 3.0, type=float)),
+                    0.0, 1e4, commit_on='finish')
 evt_tmin = NumericEdit(float(settings.value('dist/t_min_ms', 0.1, type=float)),
-                       0.0, 1e4)
+                       0.0, 1e4, commit_on='finish')
 evt_merge = NumericEdit(float(settings.value('dist/merge', 0.0, type=float)),
-                        0.0, 1e4)
+                        0.0, 1e4, commit_on='finish')
 evt_head = NumericEdit(float(settings.value('dist/head', 10.0, type=float)),
-                       0.0, 1e4)
+                       0.0, 1e4, commit_on='finish')
 evt_smooth = NumericEdit(float(settings.value('dist/smooth', 0.0, type=float)),
-                         0.0, 1e4)
+                         0.0, 1e4, commit_on='finish')
 evt_duty = NumericEdit(float(settings.value('dist/duty', 0.5, type=float)),
-                       0.0, 1.0)
+                       0.0, 1.0, commit_on='finish')
 evt_ccdf = pg.QtWidgets.QCheckBox('1-CDF (log-log)')
 evt_ccdf.setChecked(settings.value('dist/ccdf', False, type=bool))
-for _w in (pg.QtWidgets.QLabel('<b>边沿判定</b>  模式'), evt_mode,
-           pg.QtWidgets.QLabel('滞回 k·σ'), evt_k,
-           pg.QtWidgets.QLabel('最短 (ms)'), evt_tmin,
-           pg.QtWidgets.QLabel('合并 (s)'), evt_merge,
-           pg.QtWidgets.QLabel('忽略开头 (ms)'), evt_head,
-           pg.QtWidgets.QLabel('检测平滑 (ms)'), evt_smooth,
-           pg.QtWidgets.QLabel('带内占比 ≥'), evt_duty, evt_ccdf):
-    evt_ctrl2.addWidget(_w)
+
+# detailed per-parameter explanations; every label AND its field carry the
+# same tooltip (users hover the text, not the box)
+_EVT_TIP_MODE = ('事件语义——四种模式共用同一套滞回/时长逻辑：\n'
+                 'inside = 带内即事件（默认；不假定基线，带子圈住哪个电平，那段驻留就是事件）\n'
+                 'outside = 带外即事件（基线在带中，上下双向尖峰）\n'
+                 'below = y < hi 即事件（经典向下阻断，只用上边一条线）\n'
+                 'above = y > lo 即事件（向上尖峰）')
+_EVT_TIP_K = ('滞回 k·σ —— 事件结束的防抖门槛。\n'
+              '噪声会让信号在带沿反复进出；纯"进带=开始 / 出带=结束"会把一个真实\n'
+              '事件拆成大量碎片。滞回要求信号明确离开带宽 k 倍噪声 σ 才认定结束\n'
+              '（σ 由相邻采样差自动稳健估计，不受事件尖峰影响）。\n'
+              '默认 3 适合多数数据；噪声大或 spike 密可加到 5–8；0 = 完全关闭滞回')
+_EVT_TIP_TMIN = ('最短时长 —— 短于该时长的事件直接丢弃。\n'
+                 '滤掉电容毛刺与 spike 穿过带沿产生的 ~0.1–0.3 ms 碎片；\n'
+                 '两态驻留通常 ≥ 数 ms，所以 0.1–1 ms 很安全，只关心长驻留可加大到 10。\n'
+                 '内部按原始采样率换算成点数，开启平滑后自动再除以窗宽')
+_EVT_TIP_MERGE = ('合并 —— 相邻事件间隔小于该值时并成一个，把被 spike 短暂打断的\n'
+                  '真实驻留重新接上。\n'
+                  '⚠ 危险：spike 越密、碎片间隔越短，合并值过大会把整段信号串成一个\n'
+                  '巨型"假事件"（事件电平被带外间隙稀释）。spike 密集时保持 0，\n'
+                  '改用「检测平滑」压掉 spike +「带内占比」兜底')
+_EVT_TIP_HEAD = ('忽略开头 —— 每条 sweep 开头切掉这段时间，规避电容充放电瞬态\n'
+                 '（本数据瞬态可达 ±2 nA，不切会在每个 sweep 开头产生假事件）。\n'
+                 '10 ms 覆盖绝大多数情况；Stitch 模式下每条 sweep 的开头都会切')
+_EVT_TIP_SMOOTH = ('检测平滑 —— 检测前按窗宽做中位数压缩。\n'
+                   '比窗窄的 spike 被压平、比窗宽的电平台完整保留——spike 密集的\n'
+                   '两态数据的关键参数（建议 1–2 ms）。不开它时每个 spike 穿带都\n'
+                   '产生碎片；开了它 dwell/边界精度降为窗宽粒度（1 ms 窗 → 1 ms）。0 = 关闭')
+_EVT_TIP_DUTY = ('带内占比 —— 合并后事件跨度内真正在带内的时间占比，\n'
+                 '低于该值即丢弃：spike 顶部碎片链占比通常 ~3%，真实驻留 >50%，\n'
+                 '0.5 一刀分开。只对发生过合并的事件生效；0 = 关闭该过滤')
+_evt_params = [
+    ('模式', evt_mode, _EVT_TIP_MODE),
+    ('滞回 k·σ', evt_k, _EVT_TIP_K),
+    ('最短 (ms)', evt_tmin, _EVT_TIP_TMIN),
+    ('合并 (s)', evt_merge, _EVT_TIP_MERGE),
+    ('忽略开头 (ms)', evt_head, _EVT_TIP_HEAD),
+    ('检测平滑 (ms)', evt_smooth, _EVT_TIP_SMOOTH),
+    ('带内占比 ≥', evt_duty, _EVT_TIP_DUTY),
+]
+evt_ctrl2.addWidget(pg.QtWidgets.QLabel('<b>边沿判定</b>'))
+for _name, _field, _tip in _evt_params:
+    _lab = pg.QtWidgets.QLabel(_name)
+    _lab.setToolTip(_tip)
+    _field.setToolTip(_tip)
+    evt_ctrl2.addWidget(_lab)
+    evt_ctrl2.addWidget(_field)
+evt_ccdf.setToolTip('dwell 直方图切换为存活函数 1−CDF（log-log），\n'
+                    '用于区分幂律与多指数驻留分布')
+evt_ctrl2.addWidget(evt_ccdf)
 evt_ctrl2.addStretch(1)
 evt_lay.addLayout(evt_ctrl2)
-evt_mode.setToolTip('inside = 带内即事件（默认，不假定基线）\n'
-                    'outside = 带外即事件（上下双向尖峰）\n'
-                    'below = y < hi 即事件（向下阻断）\n'
-                    'above = y > lo 即事件（向上尖峰）')
-evt_k.setToolTip('事件结束要求信号明确离开带宽 k·σ（σ 自动估计），\n'
-                 '防止噪声在带沿反复进出把一个事件拆成多个；0 = 关闭滞回')
-evt_tmin.setToolTip('短于该时长的事件丢弃（去毛刺）。\n'
-                    'spike 穿带碎片 ~0.1–0.3 ms；两态驻留通常 ≥ 数 ms')
-evt_merge.setToolTip('间隔小于该值的事件合并回一个（用于重连被 spike 打断的态驻留）。\n'
-                     '⚠ 过大会把高频 spike 的顶部碎片串接成假长事件——\n'
-                     'spike 密集的数据请改用「检测平滑」+「带内占比」')
-evt_head.setToolTip('忽略每条曲线开头这段时间（电容充放电瞬态）。\n'
-                    'Stitch 模式下每条 sweep 的开头都会被切掉')
-evt_smooth.setToolTip('检测前把每条曲线按该窗宽做中位数压缩：\n'
-                      '比窗窄的 spike 被压掉，秒级电平台完整保留。\n'
-                      'spike 密集的两态数据建议 1–2 ms；0 = 关闭')
-evt_duty.setToolTip('合并后事件跨度内、真正在带内的时间占比低于该值即丢弃。\n'
-                    'spike 顶部碎片链占比 ~3%，真实态驻留 >50% —— 一刀分开')
 
 evt_ctrl3 = pg.QtWidgets.QHBoxLayout()          # workflow step 3: the result
 evt_headline = pg.QtWidgets.QLabel('')
@@ -1463,14 +1525,10 @@ def amp_recompute(full=True):
     pi = amp_plot.getPlotItem()
     pi.clear()
     _attach_ruler()
-    if not (amp_add_btn.isChecked() and amp_regions):
-        if amp_add_btn.isChecked():
-            amp_stats.setText('<span style="color:#999">已启用：按住 <b>Shift</b> 在主图内'
-                              '<b>横向拖拽</b>框选时间区域；普通拖拽 = 平移，'
-                              '轴条拖拽 = 缩放。</span>')
-        else:
-            amp_stats.setText('<span style="color:#999">添加区域：开启后按住 Shift 在'
-                              '主图内左键横向拖拽框选时间区域，看这段采样点数值的分布。</span>')
+    if not (_amp_active() and amp_regions):
+        amp_stats.setText('<span style="color:#999">本页已激活：按住 <b>Shift</b> 在主图'
+                          '内<b>横向拖拽</b>框选时间区域（普通拖拽 = 平移，轴条拖拽 = 缩放）；'
+                          '切到其他标签页会清除全部区域。</span>')
         return
     stride = 1 if full else max(1, total_points() // 200000)
     regs = [r.getRegion() for r in amp_regions]
@@ -1576,15 +1634,15 @@ def run_detection(full=True):
         if it.scene() is not None:
             pi.removeItem(it)
     _evt_overlays = []
-    if not evt_enable.isChecked() or not last_data:
+    if not _evt_active() or not last_data:
         band_region.hide()
         dwell_plot.getPlotItem().clear()
         level_plot.getPlotItem().clear()
         _last_events = None
         evt_headline.setText('<b>0 个事件</b>')
-        evt_stats.setText('<span style="color:#999">启用检测：拖动主图上的青色带两条线'
-                          '（或在上方 Y 范围框输入数值），信号进入带内=事件开始、'
-                          '离开带=事件结束；绿色 = 判定为事件的采样段。</span>')
+        evt_stats.setText('<span style="color:#999">切到本标签页即启用检测：按住 Shift '
+                          '在主图内<b>竖向拖拽</b>画出 Y 范围带（或拖带子边线、输入数值），'
+                          '信号进入带内=事件开始、离开带=事件结束；切走后自动停止。</span>')
         return
     band_region.show()
     lo, hi = band_region.getRegion()
@@ -1689,7 +1747,7 @@ def _place_band():
     distribution -- never on the baseline: an inside-mode band hugging the
     baseline flags half the trace as "events" (the G0 S19 green-wash bug).
     No-op without data; remembers that the band was placed."""
-    global _band_placed
+    global _band_placed, _band_syncing
     if not last_data:
         return
     pooled = np.concatenate([y[::max(1, len(y) // 100000)]
@@ -1700,29 +1758,46 @@ def _place_band():
     else:
         rng = (float(p1), float(p25))             # heavier lower tail
     if rng[1] > rng[0]:
-        band_region.setRegion(rng)
+        _band_syncing = True
+        try:
+            band_region.setRegion(rng)
+        finally:
+            _band_syncing = False
         _band_placed = True
+        _sync_fields_from_band()
 
 
-def detect_toggled(checked):
-    band_region.setMovable(checked)     # band edges only draggable when on
-    if checked:
-        if sec_dist.is_collapsed():
-            sec_dist.set_collapsed(False)
-        _place_band()
-    run_detection()
+def _amp_active():
+    """Amplitude mode is armed: its tab is open and the panel is expanded."""
+    return (not sec_dist.is_collapsed()
+            and dist_tabs.currentIndex() == 0)
 
 
-def amp_add_toggled(checked):
-    if checked:
-        measure_btn.setChecked(False)   # keep one armed selection mode
-        if sec_dist.is_collapsed():
-            sec_dist.set_collapsed(False)
-    # Disarming keeps the regions (analysis state -- remove them with
-    # [清空区域] instead); their handles simply freeze.
-    for r in amp_regions:               # handles only movable while armed
-        r.setMovable(checked)
+def _evt_active():
+    """Detection is armed: its tab is open and the panel is expanded."""
+    return (not sec_dist.is_collapsed()
+            and dist_tabs.currentIndex() == 1)
+
+
+_dist_tab_prev = [0]
+
+
+def _dist_view_changed(*_):
+    """Tab switch / panel collapse: opening Amplitude or Events activates
+    that mode; leaving Amplitude deletes its regions, leaving Events (or
+    collapsing the panel) stops the detection and clears its highlights.
+    Re-entering restores the band (and re-runs)."""
+    idx = dist_tabs.currentIndex()
+    was = _dist_tab_prev[0]
+    if was == 0 and idx != 0:
+        clear_amp_regions()             # 切走即清除全部区域（用户要求）
     amp_recompute()
+    if _evt_active():
+        band_region.setMovable(True)
+        if not _band_placed:
+            _place_band()
+    _dist_tab_prev[0] = idx
+    run_detection()                     # off-state hides band + clears results
 
 
 def _clear_layout(lay):
@@ -1830,9 +1905,17 @@ def _sync_band_from_fields(*_):
 
 
 def band_drag_update(y0, y1):
-    """Shift+drag Events gesture: live preview of the Y-range band."""
+    """Shift+drag Events gesture: live preview of the Y-range band.
+
+    Guarded so the programmatic setRegion does not trigger the band's own
+    signals (which would run a full detection on every mouse-move)."""
+    global _band_syncing
     lo, hi = sorted((float(y0), float(y1)))
-    band_region.setRegion((lo, hi))
+    _band_syncing = True
+    try:
+        band_region.setRegion((lo, hi))
+    finally:
+        _band_syncing = False
     band_region.show()
 
 
@@ -1840,6 +1923,7 @@ def band_drag_finish(y0, y1):
     """Commit the drawn band: extents below 3% of the view height are
     treated as accidental drags and ignored (the previous band stays)."""
     global _band_placed, _band_syncing
+    _band_preview_timer.stop()                # release cancels the preview
     view_h = vb.viewRange()[1][1] - vb.viewRange()[1][0]
     lo, hi = sorted((float(y0), float(y1)))
     if hi - lo <= 0.03 * view_h:
@@ -1942,12 +2026,34 @@ _follow_timer.timeout.connect(amp_recompute)
 
 
 def _main_range_changed(*_):
-    if amp_add_btn.isChecked() and amp_follow.isChecked() and amp_regions:
+    if _amp_active() and amp_follow.isChecked() and amp_regions:
         _follow_timer.start()
 
 
-band_region.sigRegionChanged.connect(_sync_fields_from_band)
-band_region.sigRegionChangeFinished.connect(run_detection)
+# Band drag: ZERO detection while dragging. pyqtgraph's setRegion emits
+# BOTH sigRegionChanged and sigRegionChangeFinished (even programmatically),
+# so every handler is guarded by _band_syncing/_amp_syncing: only real user
+# drags of the lines reach the debounced preview + full commit.
+_band_preview_timer = pg.QtCore.QTimer()
+_band_preview_timer.setSingleShot(True)
+_band_preview_timer.setInterval(150)
+_band_preview_timer.timeout.connect(lambda: run_detection(full=False))
+
+
+def _band_region_changed(*_):
+    _sync_fields_from_band()
+    if not _band_syncing:
+        _band_preview_timer.start()
+
+
+def _band_region_commit(*_):
+    _band_preview_timer.stop()
+    if not _band_syncing:
+        run_detection()
+
+
+band_region.sigRegionChanged.connect(_band_region_changed)
+band_region.sigRegionChangeFinished.connect(_band_region_commit)
 evt_mode.currentIndexChanged.connect(lambda *_: run_detection())
 evt_k._cb = lambda *_: run_detection()
 evt_tmin._cb = lambda *_: run_detection()
@@ -1972,17 +2078,17 @@ amp_clear_btn.clicked.connect(
     lambda: (clear_amp_regions(), _refresh_region_list(), amp_recompute()))
 vb.sigRangeChanged.connect(_main_range_changed)
 clear_btn.clicked.connect(clear_analysis)
-amp_add_btn.toggled.connect(amp_add_toggled)
-evt_enable.toggled.connect(detect_toggled)
+dist_tabs.currentChanged.connect(_dist_view_changed)
+sec_dist.btn.clicked.connect(_dist_view_changed)
 
 
 # initial hints + persisted state. Deliberately NOT persisted: the
-# Enable Detection toggle (a leftover "ghost state" used to re-enable
-# detection with an unplaced sentinel band on every launch) and the
-# Add-region drag mode -- the app always starts clean, like Measure.
+# Add-region arm / detection arm (the open tab IS the arm now) -- the app
+# always starts clean, like Measure. The last active tab is remembered.
 run_detection()
 amp_recompute()
 _refresh_region_list()
+dist_tabs.setCurrentIndex(int(settings.value('dist/tab', 0, type=int)))
 
 # load Heka's demo bundle if it is present
 demo = 'DemoV9Bundle.dat'
@@ -2030,6 +2136,7 @@ def _save_layout():
     settings.setValue('dist/smooth', evt_smooth.value())
     settings.setValue('dist/duty', evt_duty.value())
     settings.setValue('dist/ccdf', evt_ccdf.isChecked())
+    settings.setValue('dist/tab', dist_tabs.currentIndex())
     settings.setValue('amp/bins_auto', amp_auto_bins.isChecked())
     settings.setValue('amp/bins', amp_bins.value())
     settings.setValue('amp/follow', amp_follow.isChecked())
