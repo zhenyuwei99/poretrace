@@ -18,6 +18,7 @@ THEME = {
     'seam':       '#B0B0B0',                    # stitch seam dashed lines
     'band':       '#76B7B2',                    # Detect threshold band (teal)
     'event':      '#59A14F',                    # event highlight / event hists
+    'mask':       '#FFFFFF',                    # out-of-band range mask
     # Tableau 10 for <= 10 traces; Tableau 20 (deep+light shades) for <= 20;
     # beyond that a muted golden-ratio hue walk -- distinguishable, no neon
     'cycle':      ['#4E79A7', '#F28E2B', '#E15759', '#76B7B2', '#59A14F',
@@ -1006,7 +1007,7 @@ def replot():
     """
     global cur_xunit, cur_yunit, last_snap, stitch_segments, last_data
     global _stitch_active, _stitch_cache, _prep_cache, _stitched_display
-    global _data_stamp
+    global _data_stamp, _band_cleared
     plot.clear()
     legend.clear()
     data_tree.clear()
@@ -1022,6 +1023,7 @@ def replot():
     _stitch_cache = None
     _prep_cache = None
     _stitched_display = None
+    _band_cleared = False
     _data_stamp += 1
 
     selected = tree.selectedItems()
@@ -1078,7 +1080,7 @@ def replot():
             plot.plot(x, y, pen=trace_pen(i, len(items)), name=label)
 
     fit_view()
-    if _evt_active() and not _band_placed:
+    if _evt_active() and not _band_placed and not _band_cleared:
         _place_band()
     run_detection()
     amp_recompute()
@@ -1116,6 +1118,7 @@ _prep_cache = None       # (_data_stamp, head_s, smooth_ms, [...]) per trace
 _stitched_display = None # raw stitched (x, y) shown in the main plot
 _data_stamp = 0          # bumped on every last_data rebind (cache keys)
 _band_placed = False     # Y-range band placed (auto or by the user)?
+_band_cleared = False    # [清空] pressed: stay silent until a new band is drawn
 
 
 def _tint(hexcolor, alpha):
@@ -1210,12 +1213,46 @@ band_region.setZValue(-5)
 band_region.hide()
 
 
+_band_mask_top = pg.QtWidgets.QGraphicsRectItem(0, 0, 1, 1)
+_band_mask_bot = pg.QtWidgets.QGraphicsRectItem(0, 0, 1, 1)
+for _r in (_band_mask_top, _band_mask_bot):
+    _r.setBrush(_tint(THEME['mask'], 215))    # washes the trace outside the band
+    _r.setPen(pg.mkPen(None))
+    _r.setZValue(10)
+    _r.hide()
+
+
+def _update_band_mask(*_):
+    """White-out the plot areas outside the Y-range band while detection is
+    armed and the band is placed; hidden when cleared / inactive / dragging
+    an unplaced band."""
+    on = _evt_active() and _band_placed and band_region.isVisible()
+    vr = vb.viewRange()
+    x0, x1 = vr[0]
+    y0, y1 = vr[1]
+    if on:
+        lo, hi = band_region.getRegion()
+        _band_mask_top.setRect(pg.QtCore.QRectF(x0, hi, x1 - x0,
+                                                max(0.0, y1 - hi)))
+        _band_mask_bot.setRect(pg.QtCore.QRectF(x0, y0, x1 - x0,
+                                                max(0.0, lo - y0)))
+        _band_mask_top.show()
+        _band_mask_bot.show()
+    else:
+        _band_mask_top.hide()
+        _band_mask_bot.hide()
+
+
 def add_detect_items():
-    """Re-attach the Detect band to the plot (plot.clear() detaches it)."""
+    """Re-attach the Detect band and range mask (plot.clear() detaches)."""
     pi = plot.getPlotItem()
     if band_region.scene() is None:
         pi.addItem(band_region, ignoreBounds=True)
+    for _m in (_band_mask_top, _band_mask_bot):
+        if _m.scene() is None:
+            pi.addItem(_m, ignoreBounds=True)
     band_region.setVisible(_evt_active())
+    _update_band_mask()
 
 
 _amp_syncing = False
@@ -1410,6 +1447,10 @@ evt_smooth = NumericEdit(float(settings.value('dist/smooth', 0.0, type=float)),
                          0.0, 1e4, commit_on='finish')
 evt_duty = NumericEdit(float(settings.value('dist/duty', 0.5, type=float)),
                        0.0, 1.0, commit_on='finish')
+evt_dwell_log = pg.QtWidgets.QCheckBox('对数X')
+evt_dwell_log.setChecked(settings.value('dist/dwell_log', False, type=bool))
+evt_dwell_log.setToolTip('dwell 直方图用对数 bin + 对数轴（默认线性）；\n'
+                         '1-CDF 视图恒为对数-对数')
 evt_ccdf = pg.QtWidgets.QCheckBox('1-CDF (log-log)')
 evt_ccdf.setChecked(settings.value('dist/ccdf', False, type=bool))
 
@@ -1452,6 +1493,7 @@ _evt_params = [
     ('忽略开头 (ms)', evt_head, _EVT_TIP_HEAD),
     ('检测平滑 (ms)', evt_smooth, _EVT_TIP_SMOOTH),
     ('带内占比 ≥', evt_duty, _EVT_TIP_DUTY),
+    ('对数X', evt_dwell_log, evt_dwell_log.toolTip()),
 ]
 evt_ctrl2.addWidget(pg.QtWidgets.QLabel('<b>边沿判定</b>'))
 for _name, _field, _tip in _evt_params:
@@ -1468,10 +1510,15 @@ evt_lay.addLayout(evt_ctrl2)
 
 evt_ctrl3 = pg.QtWidgets.QHBoxLayout()          # workflow step 3: the result
 evt_headline = pg.QtWidgets.QLabel('')
+evt_clear_btn = pg.QtWidgets.QPushButton('清空')
+evt_clear_btn.setToolTip('清除全部检测结果并隐藏带子；\n'
+                         '之后切走再切回本标签页也不会自动放带，\n'
+                         '直到重新画出（Shift+竖向拖拽或输入数值）新的范围')
 evt_table_btn = pg.QtWidgets.QPushButton('事件表')
 evt_csv_btn = pg.QtWidgets.QPushButton('导出 CSV')
 evt_ctrl3.addWidget(evt_headline)
 evt_ctrl3.addStretch(1)
+evt_ctrl3.addWidget(evt_clear_btn)
 evt_ctrl3.addWidget(evt_table_btn)
 evt_ctrl3.addWidget(evt_csv_btn)
 evt_lay.addLayout(evt_ctrl3)
@@ -1485,6 +1532,17 @@ evt_split.addWidget(level_plot)
 evt_split.setStretchFactor(0, 1)
 evt_split.setStretchFactor(1, 1)
 evt_lay.addWidget(evt_split, 1)
+
+# Measure lines: one draggable A/B pair on each Events histogram (always on
+# while the tab is active); the readout line reports both pairs + deltas
+dwell_ma = pg.InfiniteLine(angle=90, movable=True, pen=pg.mkPen(THEME['A'], width=1))
+dwell_mb = pg.InfiniteLine(angle=90, movable=True, pen=pg.mkPen(THEME['B'], width=1))
+level_ma = pg.InfiniteLine(angle=90, movable=True, pen=pg.mkPen(THEME['A'], width=1))
+level_mb = pg.InfiniteLine(angle=90, movable=True, pen=pg.mkPen(THEME['B'], width=1))
+evt_meas_lbl = pg.QtWidgets.QLabel('')
+evt_meas_lbl.setStyleSheet('color:#666;')
+evt_lay.addWidget(evt_meas_lbl)
+
 evt_stats = pg.QtWidgets.QLabel('')
 evt_stats.setWordWrap(True)
 evt_lay.addWidget(evt_stats)
@@ -1582,15 +1640,55 @@ def amp_preview():
     amp_recompute(full=False)
 
 
+def _attach_evt_meas():
+    """(Re-)attach the measure line pairs after a histogram rebuild and
+    give unset lines a sensible start position inside the view."""
+    for pi, (ma, mb) in ((dwell_plot.getPlotItem(), (dwell_ma, dwell_mb)),
+                         (level_plot.getPlotItem(), (level_ma, level_mb))):
+        for ln in (ma, mb):
+            if ln.scene() is None:
+                pi.addItem(ln, ignoreBounds=True)
+        x0, x1 = pi.getViewBox().viewRange()[0]
+        if not x0 <= ma.value() <= x1:
+            ma.setValue(x0 + 0.3 * (x1 - x0))
+        if not x0 <= mb.value() <= x1:
+            mb.setValue(x0 + 0.7 * (x1 - x0))
+
+
+def _update_evt_meas(*_):
+    if not _evt_active():
+        evt_meas_lbl.setText('')
+        return
+    f, prefix = _yunit_scale()
+    unit_s = '%s%s' % (prefix, cur_yunit)
+
+    def _pair(va, vb_, unit):
+        return 'A=%s B=%s Δ=%s' % (fmt_si(va, unit), fmt_si(vb_, unit),
+                                   fmt_si(abs(vb_ - va), unit))
+
+    # the measure lines live in DISPLAY units: scale back to the native axis
+    # before formatting so siFormat picks the prefix exactly once
+    lvl = lambda v: fmt_si(v * f, cur_yunit)
+    lvl_txt = 'A=%s B=%s Δ=%s' % (lvl(level_ma.value()), lvl(level_mb.value()),
+                                  lvl(abs(level_mb.value() - level_ma.value())))
+    evt_meas_lbl.setText('dwell: %s &nbsp;│&nbsp; level: %s'
+                         % (_pair(dwell_ma.value(), dwell_mb.value(), 's'),
+                            lvl_txt))
+
+
 def update_event_hists(events):
-    """Redraw the Events tab: dwell histogram (log bins) or 1-CDF, plus the
-    absolute event-level histogram."""
+    """Redraw the Events histograms: dwell (linear by default, log optional,
+    or 1-CDF) and the absolute event-level histogram, in display units."""
     dwell_pi = dwell_plot.getPlotItem()
     level_pi = level_plot.getPlotItem()
     dwell_pi.clear()
     level_pi.clear()
     if not len(events):
+        _attach_evt_meas()
+        _update_evt_meas()
         return
+    f, prefix = _yunit_scale()
+    unit_s = '%s%s' % (prefix, cur_yunit)
     if evt_ccdf.isChecked():
         sv = analysis.survival_function(events['dwell'])
         if sv is not None:
@@ -1598,25 +1696,38 @@ def update_event_hists(events):
             dwell_pi.addItem(pg.PlotCurveItem(
                 sv[0], sv[1], pen=pg.mkPen(THEME['event'], width=2)))
             dwell_plot.setLabels(bottom='dwell (s, log-log)', left='S(t) = 1-CDF')
-    else:
+    elif evt_dwell_log.isChecked():
         dwell_pi.setLogMode(x=True, y=False)
         hist = analysis.log_histogram(events['dwell'])
         if hist is not None:
             edges, counts = hist
             # stepMode='center' takes the bin EDGES (len = N+1) and draws
-            # each bar centered on its bin
+            # each bar centred on its bin
             dwell_pi.addItem(pg.PlotCurveItem(
                 edges, counts, stepMode='center',
                 pen=pg.mkPen(THEME['event'], width=1),
                 fillLevel=0, brush=_tint(THEME['event'], 120)))
             dwell_plot.setLabels(bottom='dwell (s, log bins)', left='events')
+    else:
+        dwell_pi.setLogMode(x=False, y=False)
+        hist = analysis.all_point_histogram(events['dwell'])
+        if hist is not None:
+            edges, counts, under, over = hist
+            dwell_pi.addItem(pg.PlotCurveItem(
+                edges, counts, stepMode='center',
+                pen=pg.mkPen(THEME['event'], width=1),
+                fillLevel=0, brush=_tint(THEME['event'], 120)))
+            dwell_plot.setLabels(bottom='dwell (s)', left='events')
     hist = analysis.all_point_histogram(events['y_level'])
     if hist is not None:
         edges, counts, under, over = hist
         level_pi.addItem(pg.BarGraphItem(
-            x0=edges[:-1], x1=edges[1:], y0=np.zeros(len(counts)), y1=counts,
+            x0=edges[:-1] / f, x1=edges[1:] / f,
+            y0=np.zeros(len(counts)), y1=counts,
             brush=_tint(THEME['event'], 140), pen=pg.mkPen(THEME['event'], width=1)))
-        level_plot.setLabels(bottom='level (%s)' % cur_yunit, left='events')
+        level_plot.setLabels(bottom='level (%s)' % unit_s, left='events')
+    _attach_evt_meas()
+    _update_evt_meas()
 
 
 def run_detection(full=True):
@@ -1634,15 +1745,22 @@ def run_detection(full=True):
         if it.scene() is not None:
             pi.removeItem(it)
     _evt_overlays = []
-    if not _evt_active() or not last_data:
+    if not _evt_active() or not last_data or not _band_placed:
         band_region.hide()
         dwell_plot.getPlotItem().clear()
         level_plot.getPlotItem().clear()
         _last_events = None
-        evt_headline.setText('<b>0 个事件</b>')
-        evt_stats.setText('<span style="color:#999">切到本标签页即启用检测：按住 Shift '
-                          '在主图内<b>竖向拖拽</b>画出 Y 范围带（或拖带子边线、输入数值），'
-                          '信号进入带内=事件开始、离开带=事件结束；切走后自动停止。</span>')
+        if _band_cleared:
+            evt_headline.setText('<b>已清空</b>')
+            evt_stats.setText('<span style="color:#999">已清空：按住 Shift 在主图内'
+                              '<b>竖向拖拽</b>画出新的 Y 范围带后重新检测；切到其他标签页'
+                              '再切回也不会自动放带。</span>')
+        else:
+            evt_headline.setText('<b>0 个事件</b>')
+            evt_stats.setText('<span style="color:#999">切到本标签页即启用检测：按住 Shift '
+                              '在主图内<b>竖向拖拽</b>画出 Y 范围带（或拖带子边线、输入数值），'
+                              '信号进入带内=事件开始、离开带=事件结束；切走后自动停止。</span>')
+        _update_band_mask()
         return
     band_region.show()
     lo, hi = band_region.getRegion()
@@ -1732,6 +1850,17 @@ def run_detection(full=True):
                      '（多为 spike 顶部碎片链）'
                      % (res.duty_discarded, evt_duty.value() * 100))
     evt_stats.setText(txt + '<br>' + '<br>'.join(notes))
+    _update_band_mask()
+
+
+def _evt_clear():
+    """清空：remove all results and hide the band. Detection stays off and
+    the tab stays silent on re-entry until a new band is drawn."""
+    global _band_placed, _band_cleared
+    _band_placed = False
+    _band_cleared = True
+    band_region.hide()
+    run_detection()
 
 
 def clear_analysis():
@@ -1794,8 +1923,8 @@ def _dist_view_changed(*_):
     amp_recompute()
     if _evt_active():
         band_region.setMovable(True)
-        if not _band_placed:
-            _place_band()
+        if not _band_placed and not _band_cleared:
+            _place_band()                     # [清空] keeps the tab silent
     _dist_tab_prev[0] = idx
     run_detection()                     # off-state hides band + clears results
 
@@ -1877,8 +2006,9 @@ def _yunit_scale():
 
 
 def _sync_fields_from_band(*_):
-    global _band_placed
+    global _band_placed, _band_cleared
     _band_placed = True                       # the band was moved: user intent
+    _band_cleared = False
     if _band_syncing:
         return
     lo, hi = band_region.getRegion()
@@ -1888,7 +2018,7 @@ def _sync_fields_from_band(*_):
 
 
 def _sync_band_from_fields(*_):
-    global _band_syncing, _band_placed
+    global _band_syncing, _band_placed, _band_cleared
     if _band_syncing:
         return
     lo, hi = sorted((evt_lo.value(), evt_hi.value()))
@@ -1922,8 +2052,7 @@ def band_drag_update(y0, y1):
 def band_drag_finish(y0, y1):
     """Commit the drawn band: extents below 3% of the view height are
     treated as accidental drags and ignored (the previous band stays)."""
-    global _band_placed, _band_syncing
-    _band_preview_timer.stop()                # release cancels the preview
+    global _band_placed, _band_cleared, _band_syncing
     view_h = vb.viewRange()[1][1] - vb.viewRange()[1][0]
     lo, hi = sorted((float(y0), float(y1)))
     if hi - lo <= 0.03 * view_h:
@@ -2030,29 +2159,23 @@ def _main_range_changed(*_):
         _follow_timer.start()
 
 
-# Band drag: ZERO detection while dragging. pyqtgraph's setRegion emits
-# BOTH sigRegionChanged and sigRegionChangeFinished (even programmatically),
-# so every handler is guarded by _band_syncing/_amp_syncing: only real user
-# drags of the lines reach the debounced preview + full commit.
-_band_preview_timer = pg.QtCore.QTimer()
-_band_preview_timer.setSingleShot(True)
-_band_preview_timer.setInterval(150)
-_band_preview_timer.timeout.connect(lambda: run_detection(full=False))
-
-
+# Band drag: ZERO detection while dragging -- computation and marking only
+# happen after the gesture finishes. pyqtgraph's setRegion emits BOTH
+# sigRegionChanged and sigRegionChangeFinished (even programmatically), so
+# every handler is guarded by _band_syncing/_amp_syncing: only real user
+# drags of the lines reach the commit.
 def _band_region_changed(*_):
-    _sync_fields_from_band()
-    if not _band_syncing:
-        _band_preview_timer.start()
+    _sync_fields_from_band()          # field echo only -- no computation
+    _update_band_mask()               # trivial visual update, follows live
 
 
 def _band_region_commit(*_):
-    _band_preview_timer.stop()
     if not _band_syncing:
-        run_detection()
+        run_detection()               # the gesture is finished: full run
 
 
 band_region.sigRegionChanged.connect(_band_region_changed)
+band_region.sigRegionChanged.connect(_update_band_mask)
 band_region.sigRegionChangeFinished.connect(_band_region_commit)
 evt_mode.currentIndexChanged.connect(lambda *_: run_detection())
 evt_k._cb = lambda *_: run_detection()
@@ -2064,8 +2187,12 @@ evt_duty._cb = lambda *_: run_detection()
 evt_ccdf.toggled.connect(lambda *_: run_detection())
 evt_lo._cb = _sync_band_from_fields
 evt_hi._cb = _sync_band_from_fields
+evt_clear_btn.clicked.connect(_evt_clear)
 evt_table_btn.clicked.connect(_show_event_table)
 evt_csv_btn.clicked.connect(_export_events_csv)
+evt_dwell_log.toggled.connect(lambda *_: run_detection())
+for _ln in (dwell_ma, dwell_mb, level_ma, level_mb):
+    _ln.sigPositionChanged.connect(_update_evt_meas)
 amp_auto_bins.toggled.connect(lambda *_: amp_recompute())
 amp_bins._cb = lambda *_: amp_recompute()
 amp_follow.toggled.connect(lambda *_: amp_recompute())
@@ -2077,6 +2204,7 @@ ruler_b.sigPositionChanged.connect(_update_ruler)
 amp_clear_btn.clicked.connect(
     lambda: (clear_amp_regions(), _refresh_region_list(), amp_recompute()))
 vb.sigRangeChanged.connect(_main_range_changed)
+vb.sigRangeChanged.connect(_update_band_mask)
 clear_btn.clicked.connect(clear_analysis)
 dist_tabs.currentChanged.connect(_dist_view_changed)
 sec_dist.btn.clicked.connect(_dist_view_changed)
@@ -2135,6 +2263,7 @@ def _save_layout():
     settings.setValue('dist/head', evt_head.value())
     settings.setValue('dist/smooth', evt_smooth.value())
     settings.setValue('dist/duty', evt_duty.value())
+    settings.setValue('dist/dwell_log', evt_dwell_log.isChecked())
     settings.setValue('dist/ccdf', evt_ccdf.isChecked())
     settings.setValue('dist/tab', dist_tabs.currentIndex())
     settings.setValue('amp/bins_auto', amp_auto_bins.isChecked())

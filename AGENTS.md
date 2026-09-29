@@ -15,7 +15,7 @@
 - 左列三个可折叠区块（`sec_tree` / `sec_nano` / `sec_info`）在垂直 QSplitter 里，折叠靠 `setMaximumHeight` 技巧（QSplitter 会保留隐藏控件的空间）。右侧是 `dist_split`（主图 + `sec_dist` Distribution 面板）。
 - 树节点文本是路径式编号 `G0 S26 W3 T0`（对应图例 `(G#g S#w W#)` 和 `rec.get(N)`）；选中/绘图逻辑全部走 `item.index`，不要解析节点文本。
 - 分析库 `analysis.py` **纯 numpy、零 Qt**（GUI / notebook / 测试共用）；GUI 侧 `replot()` 把每条显示曲线的原始数组缓存进 `last_data = [(x, y, label, trace)]`，检测/直方图**永远按 per-trace 跑**（sweep 时间轴重叠，绝不能在拼接曲线上检测）。
-- Distribution 面板**打开 tab 即激活对应功能**（无任何启用按钮）：Amplitude tab = Shift+横向拖拽选段 + 区域列表（色块+×）+「峰标尺」（A/B 可拖竖线 + Δ 读数）；Events tab = 检测自动开启 + Y 范围 lo/hi 数值框（**单位自动取 SI 前缀**，`_yunit_scale` 按 `_data_stamp` 缓存，`_band_syncing` 防回环）+ 事件表（双击跳转）/CSV。**切走自动清理**（Amp 删区域、Events 停检测清高亮）；面板折叠 = 两者都停；`dist/tab` 记住上次 tab。
+- Distribution 面板**打开 tab 即激活对应功能**（无任何启用按钮）：Amplitude tab = Shift+横向拖拽选段 + 区域列表（色块+×）+「峰标尺」（A/B 可拖竖线 + Δ 读数）；Events tab = 检测自动开启 + Y 范围 lo/hi 数值框（**单位自动取 SI 前缀**，`_yunit_scale` 按 `_data_stamp` 缓存，`_band_syncing` 防回环）+ **[清空]**（彻底静默：`_band_cleared` 置位，切走切回不自动放带，重画/新数据才复位）+ 事件表（双击跳转）/CSV。**切走自动清理**（Amp 删区域、Events 停检测清高亮）；面板折叠 = 两者都停；`dist/tab` 记住上次 tab。
 - **手势契约**：轴条拖拽/滚轮 = 缩放；图区普通拖拽 = 平移（永远不被接管）；选择一律 **Shift+拖拽**——Amplitude tab 激活 = 横向时间区域、Events tab 激活 = 竖向画带（竖向幅度 <3% 视图高忽略）；区域/带子边缘手柄仅对应 tab 激活时 movable。Measure 仍是普通拖拽（开启时接管），与 Shift 选择天然共存、无互斥。
 - Amplitude 直方图**竖直方向**（X=电流·SI 前缀，Y=占比%）；Stitch 开启时区域取数走 `_stitched_display` 拼接原始数组（区域坐标在拼接轴上）。
 - **NumericEdit 的 `commit_on`**：参数字段全部 `'finish'`（回车/失焦才触发 cb）——`textChanged` 即时回调曾是带子拖动/bins 键入卡顿的根因（setText→cb→全量重算循环）；程序化回显用 `set_value_quiet` 或受 `_band_syncing` 守卫。
@@ -24,6 +24,7 @@
 - 「启用检测」**不持久化**（幽灵状态事故：持久化 + 哨兵带 (0,1)A → 每次启动全图铺绿）。`_band_placed` 标志：启用时无数据则等 replot 有数据后再补放带。
 - **Stitch 联动检测**：`_stitch_active` 时 `analysis_segments` 返回拼接连续轴单段（跨 sweep 态驻留才能完整检出），否则按 per-trace。`_prepped`/`_stitch_cache` 以 `(_data_stamp, head_s, smooth_ms)` 为键缓存（`_data_stamp` 在 replot 重绑 last_data 时自增，**勿用 id()**——地址复用会撞缓存）；拼接轴累加必须用**抽稀后的实测间距**（用 `trace.XInterval` 会把时间轴压缩 w 倍）。平滑 = 不相交窗中位数压缩（`dist/smooth`），spike 密集两态数据配 1–2 ms + duty_min=0.5 用；`t_min` 单位 ms（`dist/t_min_ms`），内部换算原始点数再除以窗宽。
 - overlay 曲线有点数护栏（全量 >2M 采样时按 stride 抽稀，仅视觉层；检测/统计永远全分辨率）；事件数 >5 万或**带内样本占比 >50%**（`analysis.in_band_fraction`，带子圈基线的信号）时头条红字警告。
+- Events 直方图：dwell **默认线性 bin**（`dist/dwell_log` 勾选才对数），1-CDF 恒 log-log；level 轴用 SI 前缀显示单位（native/f 换算）；**两个直方图各一对常驻 A/B 测量线**（红/蓝，`_update_evt_meas` 读数行，level 值 ×f 回原生再格式化避免 ppA 双前缀）；带子放置时主图**带外白遮罩**（`_band_mask_top/bot`，THEME['mask']，`_update_band_mask` 随带子/视图更新，`ignoreBounds` 不参与自适配）；**拖带子零检测**（`_band_region_changed` 只回显），松手 `sigRegionChangeFinished` 才全量计算+标记。
 
 ## 测试（无正式测试套件）
 
