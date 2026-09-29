@@ -155,6 +155,27 @@ def test_segments_pooling():
     assert sorted(res.events['i_seg']) == [0, 1]
 
 
+def test_moat_exit_no_negative_dwell():
+    """Hysteresis exit: a sample barely inside the moat (lo-h, lo) followed
+    by a bare crossing of lo-h used to back-extrapolate t_end far before
+    t_start (negative dwell).  The interpolated crossing must be clamped
+    into the bracketing samples."""
+    dt = 5e-5
+    t = np.arange(5000) * dt
+    y = np.full(5000, 0.0)
+    y[1000] = 25.0        # enter
+    y[1001] = 25.0
+    y[1002] = 9.0001      # barely inside the moat (lo-h, lo) with h = 1
+    y[1003] = 8.99999     # barely crosses lo - h -> exit fires here
+    res = analysis.detect_events(t, y, mode='inside', lo=10.0, hi=40.0,
+                                 h=1.0, t_min=3)
+    assert len(res.events) == 1, res.events
+    ev = res.events[0]
+    assert ev['dwell'] > 0, ev['dwell']
+    assert ev['t_start'] <= ev['t_end']
+    assert abs(ev['t_end'] - 1002 * dt) < dt        # clamped to t[1002]
+
+
 def test_validation_errors():
     y = np.zeros(100)
     t = _ramp(100)

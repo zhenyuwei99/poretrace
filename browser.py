@@ -181,17 +181,8 @@ stitch_btn.setCheckable(True)
 stitch_btn.setChecked(settings.value('stitch', False, type=bool))
 w1l.addWidget(stitch_btn, 1, 2, 1, 2)
 
-# Checkable button toggling amplitude-histogram region selection (Amp mode:
-# left-drag in the plot adds a time region for the all-point histogram)
-amp_btn = pg.QtWidgets.QPushButton("Amp")
-amp_btn.setCheckable(True)
-w1l.addWidget(amp_btn, 2, 0)
-
-# Checkable button toggling threshold-band event detection (Detect mode:
-# a draggable horizontal band, events = samples inside it per the mode)
-detect_btn = pg.QtWidgets.QPushButton("Detect")
-detect_btn.setCheckable(True)
-w1l.addWidget(detect_btn, 2, 1)
+# Amplitude-region and event-detection controls live inside the Distribution
+# panel tabs below the plot (see the distribution section), not up here.
 
 # Collapsible section: file tree
 sec_tree = Collapsible('File tree')
@@ -471,7 +462,7 @@ def measure_toggled(checked):
     vLine.setVisible(checked)
     hLine.setVisible(checked)
     if checked:
-        amp_btn.setChecked(False)      # the in-plot drag belongs to Measure
+        amp_add_btn.setChecked(False)  # the in-plot drag belongs to Measure
     if not checked:
         drag_measure_hide()
     update_title_from_state()
@@ -811,7 +802,7 @@ def vb_drag_event(ev, axis=None):
             update_title_from_state()
         return
     if (axis is None and ev.button() == pg.QtCore.Qt.LeftButton
-            and amp_btn.isChecked()):
+            and amp_add_btn.isChecked()):
         # Amp mode takes over the in-plot left-drag: rubber-band a new time
         # region for the amplitude histogram (pan is suspended; axis-strip
         # zoom still works). A tiny span on release is a click: discard.
@@ -1039,9 +1030,9 @@ def replot():
             plot.plot(x, y, pen=trace_pen(i, len(items)), name=label)
 
     fit_view()
-    if detect_btn.isChecked():
+    if evt_enable.isChecked():
         run_detection()
-    if amp_btn.isChecked():
+    if amp_add_btn.isChecked():
         amp_recompute()
 
 
@@ -1111,7 +1102,7 @@ def add_detect_items():
     pi = plot.getPlotItem()
     if band_region.scene() is None:
         pi.addItem(band_region, ignoreBounds=True)
-    band_region.setVisible(detect_btn.isChecked())
+    band_region.setVisible(evt_enable.isChecked())
 
 
 def make_region(lo, hi, k):
@@ -1144,6 +1135,7 @@ def amp_drag_finish(lo, hi):
         else:
             plot.getPlotItem().removeItem(_pending_region)
         _pending_region = None
+    _refresh_region_list()
     amp_recompute()
 
 
@@ -1155,6 +1147,7 @@ def clear_amp_regions():
             pi.removeItem(r)
     amp_regions.clear()
     _pending_region = None
+    _refresh_region_list()
 
 
 # -- Distribution panel widgets -------------------------------------------------
@@ -1171,16 +1164,26 @@ amp_lay = pg.QtWidgets.QVBoxLayout(amp_tab)
 amp_lay.setContentsMargins(4, 4, 4, 4)
 amp_lay.setSpacing(3)
 amp_ctrl = pg.QtWidgets.QHBoxLayout()
+amp_add_btn = pg.QtWidgets.QPushButton('添加区域')
+amp_add_btn.setCheckable(True)
+amp_add_btn.setToolTip('开启后在主图内左键拖拽框选一个时间区域（可与 Measure 互斥）')
+amp_clear_btn = pg.QtWidgets.QPushButton('清空区域')
 amp_auto_bins = pg.QtWidgets.QCheckBox('auto bins')
 amp_auto_bins.setChecked(settings.value('amp/bins_auto', True, type=bool))
 amp_bins = NumericEdit(float(settings.value('amp/bins', 150.0, type=float)),
                        8, 4096)
 amp_follow = pg.QtWidgets.QCheckBox('range = view Y')
 amp_follow.setChecked(settings.value('amp/follow', False, type=bool))
-for _w in (amp_auto_bins, pg.QtWidgets.QLabel('bins'), amp_bins, amp_follow):
+for _w in (amp_add_btn, amp_clear_btn, amp_auto_bins,
+           pg.QtWidgets.QLabel('bins'), amp_bins, amp_follow):
     amp_ctrl.addWidget(_w)
 amp_ctrl.addStretch(1)
 amp_lay.addLayout(amp_ctrl)
+amp_list_widget = pg.QtWidgets.QWidget()          # one row per committed region
+amp_list_lay = pg.QtWidgets.QVBoxLayout(amp_list_widget)
+amp_list_lay.setContentsMargins(0, 0, 0, 0)
+amp_list_lay.setSpacing(1)
+amp_lay.addWidget(amp_list_widget)
 amp_plot = pg.PlotWidget()
 amp_plot.getPlotItem().getViewBox().setYLink(vb)
 amp_lay.addWidget(amp_plot, 1)
@@ -1189,12 +1192,34 @@ amp_stats.setWordWrap(True)
 amp_lay.addWidget(amp_stats)
 dist_tabs.addTab(amp_tab, 'Amplitude')
 
-# Events tab: dwell / level histograms side by side, params on top
+# Events tab: laid out in workflow order -- enable, Y range, edge rules,
+# then the headline result and the histograms
 evt_tab = pg.QtWidgets.QWidget()
 evt_lay = pg.QtWidgets.QVBoxLayout(evt_tab)
 evt_lay.setContentsMargins(4, 4, 4, 4)
-evt_lay.setSpacing(3)
-evt_ctrl = pg.QtWidgets.QHBoxLayout()
+evt_lay.setSpacing(2)
+
+evt_ctrl0 = pg.QtWidgets.QHBoxLayout()
+evt_enable = pg.QtWidgets.QCheckBox('启用检测')
+evt_enable.setToolTip('在主图上放置青色 Y 范围带：信号进入带内=事件开始，离开带=事件结束')
+_evt_hint = pg.QtWidgets.QLabel('绿色 = 判定为事件的采样段；带子应圈住事件电流水平，不要圈基线')
+_evt_hint.setStyleSheet('color:#999;')
+evt_ctrl0.addWidget(evt_enable)
+evt_ctrl0.addWidget(_evt_hint)
+evt_ctrl0.addStretch(1)
+evt_lay.addLayout(evt_ctrl0)
+
+evt_ctrl1 = pg.QtWidgets.QHBoxLayout()          # workflow step 1: the Y range
+evt_lo = NumericEdit(0.0, -1e6, 1e6)
+evt_hi = NumericEdit(1.0, -1e6, 1e6)
+for _w in (pg.QtWidgets.QLabel('<b>Y 范围</b>  lo'), evt_lo,
+           pg.QtWidgets.QLabel('–  hi'), evt_hi,
+           pg.QtWidgets.QLabel('<span style="color:#999">(与主图青色带双向同步，可直接输入)</span>')):
+    evt_ctrl1.addWidget(_w)
+evt_ctrl1.addStretch(1)
+evt_lay.addLayout(evt_ctrl1)
+
+evt_ctrl2 = pg.QtWidgets.QHBoxLayout()          # workflow step 2: edge rules
 evt_mode = pg.QtWidgets.QComboBox()
 evt_mode.addItems(['inside', 'outside', 'below', 'above'])
 evt_mode.setCurrentText(settings.value('dist/mode', 'inside', type=str))
@@ -1204,14 +1229,24 @@ evt_tmin = NumericEdit(float(settings.value('dist/t_min', 3.0, type=float)),
 evt_merge = NumericEdit(float(settings.value('dist/merge', 0.0, type=float)),
                         0.0, 1e4)
 evt_ccdf = pg.QtWidgets.QCheckBox('1-CDF (log-log)')
-evt_ccdf.setChecked(settings.value('dist/ccdf', False, type=bool))
-for _w in (pg.QtWidgets.QLabel('mode'), evt_mode,
-           pg.QtWidgets.QLabel('h = k·σ'), evt_k,
-           pg.QtWidgets.QLabel('t_min (pts)'), evt_tmin,
-           pg.QtWidgets.QLabel('merge (s)'), evt_merge, evt_ccdf):
-    evt_ctrl.addWidget(_w)
-evt_ctrl.addStretch(1)
-evt_lay.addLayout(evt_ctrl)
+for _w in (pg.QtWidgets.QLabel('<b>边沿判定</b>  模式'), evt_mode,
+           pg.QtWidgets.QLabel('滞回 k·σ'), evt_k,
+           pg.QtWidgets.QLabel('最短 (点)'), evt_tmin,
+           pg.QtWidgets.QLabel('合并 (s)'), evt_merge, evt_ccdf):
+    evt_ctrl2.addWidget(_w)
+evt_ctrl2.addStretch(1)
+evt_lay.addLayout(evt_ctrl2)
+
+evt_ctrl3 = pg.QtWidgets.QHBoxLayout()          # workflow step 3: the result
+evt_headline = pg.QtWidgets.QLabel('')
+evt_table_btn = pg.QtWidgets.QPushButton('事件表')
+evt_csv_btn = pg.QtWidgets.QPushButton('导出 CSV')
+evt_ctrl3.addWidget(evt_headline)
+evt_ctrl3.addStretch(1)
+evt_ctrl3.addWidget(evt_table_btn)
+evt_ctrl3.addWidget(evt_csv_btn)
+evt_lay.addLayout(evt_ctrl3)
+
 evt_split = pg.QtWidgets.QSplitter(pg.QtCore.Qt.Horizontal)
 dwell_plot = pg.PlotWidget()
 dwell_plot.getPlotItem().setLogMode(x=True)
@@ -1250,9 +1285,13 @@ def amp_recompute(full=True):
     """
     pi = amp_plot.getPlotItem()
     pi.clear()
-    if not (amp_btn.isChecked() and amp_regions):
-        amp_stats.setText('<span style="color:#999">Amp: enable, then '
-                          'left-drag in the plot to add time regions.</span>')
+    if not (amp_add_btn.isChecked() and amp_regions):
+        if amp_add_btn.isChecked():
+            amp_stats.setText('<span style="color:#999">已启用：在主图内<b>左键拖拽</b>'
+                              '框选一个时间区域，直方图与统计会出现在这里。</span>')
+        else:
+            amp_stats.setText('<span style="color:#999">添加区域：开启「添加区域」后在'
+                              '主图内左键拖拽框选时间区域，看这段采样点数值的分布。</span>')
         return
     stride = 1 if full else max(1, total_points() // 200000)
     regs = [r.getRegion() for r in amp_regions]
@@ -1345,24 +1384,34 @@ def run_detection(full=True):
     recomputes in full. Raises of heka.analysis (bad band vs hysteresis)
     land in the stats label instead of a dialog.
     """
-    global _evt_overlays
+    global _evt_overlays, _last_events, _last_labels
     pi = plot.getPlotItem()
     for it in _evt_overlays:
         if it.scene() is not None:
             pi.removeItem(it)
     _evt_overlays = []
-    if not detect_btn.isChecked() or not last_data:
+    if not evt_enable.isChecked() or not last_data:
         band_region.hide()
         dwell_plot.getPlotItem().clear()
         level_plot.getPlotItem().clear()
-        evt_stats.setText('<span style="color:#999">Detect: enable, then drag '
-                          'the teal band; what counts as an event depends on '
-                          'the mode (default: samples inside the band).</span>')
+        _last_events = None
+        evt_headline.setText('<b>0 个事件</b>')
+        evt_stats.setText('<span style="color:#999">启用检测：拖动主图上的青色带两条线'
+                          '（或在上方 Y 范围框输入数值），信号进入带内=事件开始、'
+                          '离开带=事件结束；绿色 = 判定为事件的采样段。</span>')
         return
     band_region.show()
     lo, hi = band_region.getRegion()
-    stride = 1 if full else max(1, total_points() // 200000)
+    total = total_points()
+    stride = 1 if full else max(1, total // 200000)
     segs = analysis_segments(stride)
+    # the overlay is a visual indicator only: cap it to ~2M points so a
+    # whole-Group view (tens of millions of samples) stays fluid. Detection
+    # and all statistics below always run on the full-resolution segs.
+    if stride == 1 and total > 2000000:
+        osegs = analysis_segments(max(1, total // 2000000))
+    else:
+        osegs = segs
     try:
         res = analysis.detect_events_segments(
             segs, mode=evt_mode.currentText(), lo=lo, hi=hi, h=None,
@@ -1371,14 +1420,17 @@ def run_detection(full=True):
     except ValueError as exc:
         dwell_plot.getPlotItem().clear()
         level_plot.getPlotItem().clear()
-        evt_stats.setText('<span style="color:%s">%s</span>'
-                          % (THEME['A'], exc))
+        _last_events = None
+        evt_headline.setText('<b>0 个事件</b>')
+        evt_stats.setText('<span style="color:%s">%s</span>' % (THEME['A'], exc))
         return
     events = res.events
+    _last_events = events
+    _last_labels = [label for _, _, label, _ in last_data]
 
     # highlight the event stretches on the displayed traces (NaN outside
     # events + connect='finite' breaks the line there)
-    for k, (x, y) in enumerate(segs):
+    for k, (x, y) in enumerate(osegs):
         ev = events[events['i_seg'] == k]
         if not len(ev):
             continue
@@ -1396,20 +1448,27 @@ def run_detection(full=True):
     update_event_hists(events)
     dur = sum(float(x[-1] - x[0]) for x, _ in segs if len(x) > 1)
     if len(events) and dur > 0:
-        txt = ('N=%d events   rate=%s   dwell: median=%s  mean=%s   '
-               'level: median=%s'
-               % (len(events), fmt_si(len(events) / dur, 'Hz'),
-                  fmt_si(float(np.median(events['dwell'])), 's'),
+        head = '<b>发现 %d 个事件 · %s</b>' % (len(events),
+                                              fmt_si(len(events) / dur, 'Hz'))
+    else:
+        head = '<b>0 个事件</b>'
+    if len(events) > 50000:
+        head += ('<br><span style="color:%s">事件数异常大：带子可能贴着基线/噪声，'
+                 '请调整 Y 范围</span>' % THEME['A'])
+    evt_headline.setText(head)
+    if len(events):
+        txt = ('dwell: median=%s  mean=%s   level: median=%s'
+               % (fmt_si(float(np.median(events['dwell'])), 's'),
                   fmt_si(float(events['dwell'].mean()), 's'),
                   fmt_si(float(np.median(events['y_level'])), cur_yunit)))
     else:
-        txt = 'no events inside the band'
+        txt = ''
     notes = ['h=%s (= %.4g·σ, σ=%s)'
              % (fmt_si(res.h, cur_yunit), res.h / res.sigma if res.sigma else 0,
                 fmt_si(res.sigma, cur_yunit))]
     if res.boundary_discarded:
-        notes.append('%d boundary event(s) discarded (entry or exit not '
-                     'observed)' % res.boundary_discarded)
+        notes.append('%d 个边界事件被丢弃（进入或离开未被观测到，即事件跨越数据首尾）'
+                     % res.boundary_discarded)
     evt_stats.setText(txt + '<br>' + '<br>'.join(notes))
 
 
@@ -1423,22 +1482,183 @@ def clear_analysis():
 
 def detect_toggled(checked):
     settings.setValue('dist/enabled', checked)
-    if checked and last_data:
-        pooled = np.concatenate([y[::max(1, len(y) // 100000)]
-                                 for _, y, _, _ in last_data])
-        p25, p75 = np.percentile(pooled, [25, 75])
-        if p75 > p25:
-            band_region.setRegion((float(p25), float(p75)))
+    if checked:
+        if sec_dist.is_collapsed():
+            sec_dist.set_collapsed(False)
+        if last_data:
+            # Place the band on the EVENT side of the amplitude distribution,
+            # never on the baseline: an inside-mode band hugging the baseline
+            # flags half the trace as "events" (the G0 S19 green-wash bug).
+            pooled = np.concatenate([y[::max(1, len(y) // 100000)]
+                                     for _, y, _, _ in last_data])
+            p1, p25, p50, p75, p99 = np.percentile(pooled, [1, 25, 50, 75, 99])
+            if p99 - p50 >= p50 - p1:
+                rng = (float(p75), float(p99))    # heavier upper tail
+            else:
+                rng = (float(p1), float(p25))     # heavier lower tail
+            if rng[1] > rng[0]:
+                band_region.setRegion(rng)
     run_detection()
 
 
-def amp_toggled(checked):
-    settings.setValue('amp/enabled', checked)
+def amp_add_toggled(checked):
     if checked:
-        measure_btn.setChecked(False)  # the in-plot drag belongs to Amp
-    if not checked:
+        measure_btn.setChecked(False)   # the in-plot drag belongs to Amp
+        if sec_dist.is_collapsed():
+            sec_dist.set_collapsed(False)
+    else:
         clear_amp_regions()
     amp_recompute()
+
+
+def _clear_layout(lay):
+    while lay.count():
+        it = lay.takeAt(0)
+        if it.widget() is not None:
+            it.widget().deleteLater()
+
+
+def _refresh_region_list():
+    """One row per committed Amp region: color chip, time span, remove ×."""
+    _clear_layout(amp_list_lay)
+    for k, r in enumerate(amp_regions):
+        color = THEME['cycle'][k % len(THEME['cycle'])]
+        row = pg.QtWidgets.QWidget()
+        rl = pg.QtWidgets.QHBoxLayout(row)
+        rl.setContentsMargins(2, 0, 2, 0)
+        rl.setSpacing(6)
+        chip = pg.QtWidgets.QLabel()
+        chip.setFixedSize(10, 10)
+        chip.setStyleSheet('background:%s; border-radius:3px;' % color)
+        lo, hi = r.getRegion()
+        text = pg.QtWidgets.QLabel('#%d   %.6g – %.6g %s'
+                                   % (k, lo, hi, cur_xunit))
+        rm = pg.QtWidgets.QPushButton('×')
+        rm.setFlat(True)
+        rm.setFixedWidth(18)
+        rm.clicked.connect(lambda _=False, r=r: _remove_region(r))
+        rl.addWidget(chip)
+        rl.addWidget(text)
+        rl.addStretch(1)
+        rl.addWidget(rm)
+        amp_list_lay.addWidget(row)
+    amp_list_lay.addStretch(1)
+
+
+def _remove_region(r):
+    if r.scene() is not None:
+        plot.getPlotItem().removeItem(r)
+    if r in amp_regions:
+        amp_regions.remove(r)
+    _refresh_region_list()
+    amp_recompute()
+
+
+# -- Y-range numeric fields <-> threshold band, two-way sync --------------------
+
+_band_syncing = False
+
+
+def _sync_fields_from_band(*_):
+    if _band_syncing:
+        return
+    lo, hi = band_region.getRegion()
+    evt_lo.setText(evt_lo._fmt(lo))
+    evt_hi.setText(evt_hi._fmt(hi))
+
+
+def _sync_band_from_fields(*_):
+    global _band_syncing
+    if _band_syncing:
+        return
+    lo, hi = sorted((evt_lo.value(), evt_hi.value()))
+    if not hi > lo:
+        return
+    _band_syncing = True
+    try:
+        band_region.setRegion((lo, hi))
+        run_detection()
+    finally:
+        _band_syncing = False
+
+
+# -- Event table + CSV export -----------------------------------------------------
+
+_evt_dialog = None
+_last_events = None
+_last_labels = []
+
+
+def _write_events_csv(path):
+    """Full event list as CSV (the on-screen table is capped; this is not)."""
+    if _last_events is None or not len(_last_events):
+        return False
+    np.savetxt(path, _last_events, delimiter=',',
+               header='t_start,t_end,dwell,y_level,i_seg', comments='')
+    return True
+
+
+def _export_events_csv():
+    if _last_events is None or not len(_last_events):
+        return
+    path, _ = pg.QtWidgets.QFileDialog.getSaveFileName(
+        win, '导出事件 CSV',
+        os.path.join(settings.value('last_dir', ''), 'events.csv'),
+        'CSV (*.csv)')
+    if path:
+        _write_events_csv(path)
+
+
+def _show_event_table():
+    """Non-modal table of the detected events; double-click a row to jump
+    the main view onto that event."""
+    global _evt_dialog
+    if _last_events is None or not len(_last_events):
+        return
+    ev = _last_events
+    if _evt_dialog is not None:
+        _evt_dialog.close()
+    dlg = pg.QtWidgets.QDialog(win)
+    dlg.setAttribute(pg.QtCore.Qt.WA_DeleteOnClose)
+    dlg.setWindowTitle('事件表（共 %d 个）' % len(ev))
+    lay = pg.QtWidgets.QVBoxLayout(dlg)
+    shown = ev[:1000]
+    table = pg.QtWidgets.QTableWidget(len(shown), 6)
+    table.setHorizontalHeaderLabels(
+        ['#', 'sweep', 't_start (s)', 't_end (s)', 'dwell (s)',
+         'level (%s)' % cur_yunit])
+    table.setEditTriggers(pg.QtWidgets.QAbstractItemView.NoEditTriggers)
+    table.setAlternatingRowColors(True)
+    for i, e in enumerate(shown):
+        seg = int(e['i_seg'])
+        name = _last_labels[seg] if seg < len(_last_labels) else str(seg)
+        for c, val in enumerate(('%d' % i, name,
+                                 '%.6g' % e['t_start'], '%.6g' % e['t_end'],
+                                 '%.6g' % e['dwell'], '%.6g' % e['y_level'])):
+            table.setItem(i, c, pg.QtWidgets.QTableWidgetItem(val))
+    table.resizeColumnsToContents()
+    lay.addWidget(table)
+    if len(ev) > len(shown):
+        lay.addWidget(pg.QtWidgets.QLabel(
+            '仅显示前 %d 行；CSV 导出包含全部 %d 个事件' % (len(shown), len(ev))))
+
+    def _jump(row, _col):
+        e = ev[row]
+        pad = max((e['t_end'] - e['t_start']) * 2.0, 0.02)
+        vb.setXRange(e['t_start'] - pad, e['t_end'] + pad, padding=0)
+
+    table.cellDoubleClicked.connect(_jump)
+    btns = pg.QtWidgets.QHBoxLayout()
+    b_csv = pg.QtWidgets.QPushButton('导出 CSV')
+    b_csv.clicked.connect(_export_events_csv)
+    b_close = pg.QtWidgets.QPushButton('关闭')
+    b_close.clicked.connect(dlg.close)
+    btns.addStretch(1)
+    btns.addWidget(b_csv)
+    btns.addWidget(b_close)
+    lay.addLayout(btns)
+    _evt_dialog = dlg
+    dlg.show()
 
 
 # Debounced refresh of the amplitude histogram while the user zooms the main
@@ -1450,31 +1670,39 @@ _follow_timer.timeout.connect(amp_recompute)
 
 
 def _main_range_changed(*_):
-    if amp_btn.isChecked() and amp_follow.isChecked() and amp_regions:
+    if amp_add_btn.isChecked() and amp_follow.isChecked() and amp_regions:
         _follow_timer.start()
 
 
-band_region.sigRegionChanged.connect(amp_preview)
+band_region.sigRegionChanged.connect(_sync_fields_from_band)
 band_region.sigRegionChangeFinished.connect(run_detection)
 evt_mode.currentIndexChanged.connect(lambda *_: run_detection())
 evt_k._cb = lambda *_: run_detection()
 evt_tmin._cb = lambda *_: run_detection()
 evt_merge._cb = lambda *_: run_detection()
 evt_ccdf.toggled.connect(lambda *_: run_detection())
+evt_lo._cb = _sync_band_from_fields
+evt_hi._cb = _sync_band_from_fields
+evt_table_btn.clicked.connect(_show_event_table)
+evt_csv_btn.clicked.connect(_export_events_csv)
 amp_auto_bins.toggled.connect(lambda *_: amp_recompute())
 amp_bins._cb = lambda *_: amp_recompute()
 amp_follow.toggled.connect(lambda *_: amp_recompute())
+amp_clear_btn.clicked.connect(
+    lambda: (clear_amp_regions(), _refresh_region_list(), amp_recompute()))
 vb.sigRangeChanged.connect(_main_range_changed)
 clear_btn.clicked.connect(clear_analysis)
-amp_btn.toggled.connect(amp_toggled)
-detect_btn.toggled.connect(detect_toggled)
+amp_add_btn.toggled.connect(amp_add_toggled)
+evt_enable.toggled.connect(detect_toggled)
 
 
-# initial hints + persisted on/off state
+# initial hints + persisted state (the Add-region drag mode is deliberately
+# NOT persisted -- like Measure -- so the plot always pans on a fresh start)
 run_detection()
 amp_recompute()
-amp_btn.setChecked(settings.value('amp/enabled', False, type=bool))
-detect_btn.setChecked(settings.value('dist/enabled', False, type=bool))
+_refresh_region_list()
+evt_ccdf.setChecked(settings.value('dist/ccdf', False, type=bool))
+evt_enable.setChecked(settings.value('dist/enabled', False, type=bool))
 
 # load Heka's demo bundle if it is present
 demo = 'DemoV9Bundle.dat'

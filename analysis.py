@@ -81,12 +81,20 @@ def _mode_masks(y, mode, lo, hi, h):
 
 
 def _cross_time(t, y, i, thr):
-    """Linear-interpolated time at which y crosses thr between samples
-    i-1 and i (sub-sample boundary precision)."""
+    """Band-edge crossing time between samples i-1 and i, linearly
+    interpolated (sub-sample boundary precision).
+
+    frac is clipped to [0, 1] so the estimate never extrapolates outside
+    the bracketing samples: near a hysteresis exit the signal can sit in
+    the moat (inside [lo-h, lo)) for one sample and then barely cross the
+    exit threshold, which without the clip back-extrapolates t_end far
+    before t_start (negative dwell).
+    """
     y0, y1 = y[i - 1], y[i]
     if y1 == y0:
         return float(t[i])
     frac = (thr - y0) / (y1 - y0)
+    frac = min(max(frac, 0.0), 1.0)
     return float(t[i - 1] + frac * (t[i] - t[i - 1]))
 
 
