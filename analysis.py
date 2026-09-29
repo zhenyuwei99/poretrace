@@ -22,7 +22,7 @@ EVENT_DTYPE = np.dtype([('t_start', 'f8'), ('t_end', 'f8'), ('dwell', 'f8'),
                         ('y_level', 'f8'), ('i_seg', 'i4')])
 
 EventResult = namedtuple('EventResult',
-                         'events h sigma boundary_discarded')
+                         'events h sigma boundary_discarded duty_discarded')
 
 
 def noise_sigma(y):
@@ -114,7 +114,8 @@ def _edge_for(ys, ye, lo, hi, mode):
 
 
 def detect_events(t, y, mode='inside', lo=None, hi=None, h=None, k=3.0,
-                  t_min=3, merge_gap=0.0, interpolate=True):
+                  t_min=3, merge_gap=0.0, duty_min=0.0, t_head=0.0,
+                  interpolate=True):
     """Detect events in one time series.
 
     Parameters
@@ -129,12 +130,21 @@ def detect_events(t, y, mode='inside', lo=None, hi=None, h=None, k=3.0,
     t_min      minimum event length in samples; shorter runs are dropped
     merge_gap  events separated by less than this (t units) are merged;
                0 disables merging (hysteresis alone usually suffices)
+    duty_min   after merging, drop events whose in-band time fraction is
+               below this (0..1). Chains of brief spike-top fragments
+               merged across gaps have a tiny duty cycle (~3%), while a
+               genuine level sojourn merely interrupted by spikes stays
+               above ~50% -- one number separates them.
+    t_head     ignore this many seconds at the START of the series
+               (capacitor-charging transient of the sweep)
     interpolate  linearly interpolate boundary crossings (sub-sample times)
 
-    Returns EventResult(events, h, sigma, boundary_discarded): events is a
-    structured array (t_start, t_end, dwell, y_level, i_seg); an event whose
-    entry or exit was not observed (already inside the band at sample 0, or
-    never leaving it before the array ends) is discarded and counted in
+    Returns EventResult(events, h, sigma, boundary_discarded,
+    duty_discarded): events is a structured array (t_start, t_end, dwell,
+    y_level, i_seg) where y_level is the mean of the IN-BAND samples only
+    (merged gaps between fragments do not dilute it); an event whose entry
+    or exit was not observed (already inside the band at the first sample,
+    or never leaving it before the array ends) is discarded and counted in
     boundary_discarded.
     """
     t = np.asarray(t, dtype=float)
@@ -142,8 +152,15 @@ def detect_events(t, y, mode='inside', lo=None, hi=None, h=None, k=3.0,
     sigma = noise_sigma(y)
     if h is None:
         h = k * sigma
+    if t_head > 0:
+        head = int(np.searchsorted(t, t[0] + t_head, side='left'))
+        if head >= t.size - 1:
+            return EventResult(np.empty(0, EVENT_DTYPE), float(h),
+                               float(sigma), 0, 0)
+        t = t[head:]
+        y = y[head:]
     if t.size != y.size or t.size < 2:
-        return EventResult(np.empty(0, EVENT_DTYPE), float(h), float(sigma), 0)
+        return EventResult(np.empty(0, EVENT_DTYPE), float(h), float(sigma), 0, 0)
     if not np.isfinite(t).all() or not np.isfinite(y).all():
         raise ValueError('detect_events needs finite t / y arrays')
 
@@ -180,8 +197,23 @@ def detect_events(t, y, mode='inside', lo=None, hi=None, h=None, k=3.0,
     # observed: drop runs that were already inside the band at sample 0
     # (their true start lies before the recording) or never exited.
     boundary += sum(1 for s0, _ in spans if s0 == 0)
-    spans = [(s0, e0) for s0, e0 in spans
-             if s0 > 0 and e0 - s0 >= t_min]
+    spans = [(s0, e0) for s0, e0 in spans if s0 > 0]
+
+    # Duty filter: a merged chain of brief spike-top fragments spends only
+    # a tiny fraction of its span inside the band, while a genuine level
+    # sojourn merely interrupted by spikes stays mostly in-band.
+    duty_discarded = 0
+    if duty_min > 0 and spans:
+        kept = []
+        for s0, e0 in spans:
+            duty = float(np.mean(enter[s0:e0]))
+            if duty >= duty_min:
+                kept.append((s0, e0))
+            else:
+                duty_discarded += 1
+        spans = kept
+
+    spans = [(s0, e0) for s0, e0 in spans if e0 - s0 >= t_min]
 
     out = np.empty(len(spans), dtype=EVENT_DTYPE)
     n = len(t)
@@ -195,11 +227,13 @@ def detect_events(t, y, mode='inside', lo=None, hi=None, h=None, k=3.0,
             t1 = _cross_time(t, y, e0, _edge_for(y[e0 - 1], y[e0], lo, hi, mode))
         else:
             t1 = float(t[last])
-        a, b = s0 + 1, last - 1                  # trim transition samples
-        if b < a:
-            a, b = s0, last
-        out[j] = (t0, t1, t1 - t0, float(np.mean(y[a:b + 1])), 0)
-    return EventResult(out, float(h), float(sigma), boundary)
+        in_band = y[s0:e0][enter[s0:e0]]         # level = in-band samples only
+        if in_band.size:
+            ylev = float(np.mean(in_band))
+        else:                                    # single-threshold fallback
+            ylev = float(np.mean(y[s0:e0]))
+        out[j] = (t0, t1, t1 - t0, ylev, 0)
+    return EventResult(out, float(h), float(sigma), boundary, duty_discarded)
 
 
 def detect_events_segments(segments, **kwargs):
@@ -212,7 +246,7 @@ def detect_events_segments(segments, **kwargs):
     """
     events = []
     h_vals, sig_vals = [], []
-    boundary = 0
+    boundary = duty_discarded = 0
     for i, (t, y) in enumerate(segments):
         res = detect_events(t, y, **kwargs)
         if len(res.events):
@@ -222,11 +256,12 @@ def detect_events_segments(segments, **kwargs):
         h_vals.append(res.h)
         sig_vals.append(res.sigma)
         boundary += res.boundary_discarded
+        duty_discarded += res.duty_discarded
     pooled = np.concatenate(events) if events else np.empty(0, EVENT_DTYPE)
     n = len(h_vals) or 1
     return EventResult(pooled,
                        float(np.sum(h_vals) / n), float(np.sum(sig_vals) / n),
-                       boundary)
+                       boundary, duty_discarded)
 
 
 def fd_bin_count(y, lo=32, hi=256):

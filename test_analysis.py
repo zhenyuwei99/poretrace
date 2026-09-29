@@ -176,6 +176,58 @@ def test_moat_exit_no_negative_dwell():
     assert abs(ev['t_end'] - 1002 * dt) < dt        # clamped to t[1002]
 
 
+def test_y_level_in_band_and_duty_filter():
+    """A merge_gap chain of brief spike-top fragments: the merged event's
+    y_level must average IN-BAND samples only (not the gaps), and a tiny
+    duty cycle chain is dropped when duty_min is set."""
+    dt = 5e-5
+    n = 5000
+    y = np.zeros(n)
+    for start in (1000, 1200, 1400):        # 20-sample tops, 100-sample gaps
+        y[start:start + 20] = 25.0
+    t = _ramp(n)
+    kw = dict(mode='inside', lo=10.0, hi=40.0, h=1.0, t_min=3, merge_gap=0.012)
+    keep = analysis.detect_events(t, y, duty_min=0.0, **kw)
+    assert len(keep.events) == 1, keep.events
+    ev = keep.events[0]
+    assert ev['y_level'] == 25.0, ev['y_level']     # not diluted by the gaps
+    assert abs(ev['dwell'] - 420 * dt) < 3 * dt     # full merged span
+    drop = analysis.detect_events(t, y, duty_min=0.5, **kw)
+    assert len(drop.events) == 0
+    assert drop.duty_discarded == 1
+
+
+def test_duty_keeps_interrupted_sojourn():
+    """A genuine level sojourn merely interrupted by brief spikes stays
+    above the duty threshold once merged."""
+    n = 5000
+    y = np.zeros(n)
+    y[1000:3000] = 25.0                     # long sojourn
+    y[1500:1505] = 0.0                      # brief spikes out of band
+    y[2200:2206] = 0.0
+    res = analysis.detect_events(_ramp(n), y, mode='inside', lo=10.0, hi=40.0,
+                                 h=1.0, t_min=3, merge_gap=0.05, duty_min=0.5)
+    assert len(res.events) == 1, res.events
+    ev = res.events[0]
+    assert ev['y_level'] == 25.0
+    assert ev['dwell'] > 1980 * 5e-5        # spans the whole sojourn
+    assert res.duty_discarded == 0
+
+
+def test_t_head_ignores_transient():
+    n = 5000
+    y = np.zeros(n)
+    y[100:200] = 25.0                       # pulse right after the start
+    kw = dict(mode='inside', lo=10.0, hi=40.0, h=1.0, t_min=3)
+    full = analysis.detect_events(_ramp(n), y, **kw)
+    assert len(full.events) == 1
+    cut = analysis.detect_events(_ramp(n), y, t_head=150 * 5e-5, **kw)
+    assert len(cut.events) == 0             # pulse falls inside the ignored head
+    keep = analysis.detect_events(_ramp(n), y, t_head=50 * 5e-5, **kw)
+    assert len(keep.events) == 1
+    assert abs(keep.events[0]['t_start'] - 100 * 5e-5) < 3 * 5e-5
+
+
 def test_validation_errors():
     y = np.zeros(100)
     t = _ramp(100)

@@ -967,6 +967,7 @@ def replot():
     (deduplicated) of all expanded traces.
     """
     global cur_xunit, cur_yunit, last_snap, stitch_segments, last_data
+    global _stitch_active, _stitch_cache, _prep_cache
     plot.clear()
     legend.clear()
     data_tree.clear()
@@ -978,6 +979,9 @@ def replot():
     add_detect_items()
     zoom_history.clear()
     stitch_segments = []
+    _stitch_active = False
+    _stitch_cache = None
+    _prep_cache = None
 
     selected = tree.selectedItems()
     if len(selected) < 1 or bundle is None:
@@ -1017,6 +1021,7 @@ def replot():
         cur_yunit = trace0.YUnit
         x, y, seams, seg_infos = build_stitched(last_data)
         stitch_segments = seg_infos
+        _stitch_active = True
         plot.plot(x, y, pen=pg.mkPen(THEME['cycle'][0], width=1), name='stitched ×%d' % len(items))
         for t in seams:
             line = pg.InfiniteLine(pos=t, angle=90, movable=False,
@@ -1031,6 +1036,8 @@ def replot():
 
     fit_view()
     if evt_enable.isChecked():
+        if not _band_placed:
+            _place_band()          # enabled before loading: place now
         run_detection()
     if amp_add_btn.isChecked():
         amp_recompute()
@@ -1062,6 +1069,10 @@ last_data = []           # (x, y, label, trace) of every displayed trace
 amp_regions = []         # committed time-region items
 _pending_region = None   # region currently being rubber-band dragged
 _evt_overlays = []       # event highlight curves in the main plot
+_stitch_active = False   # Stitch on -> detection runs on the continuous axis
+_stitch_cache = None     # (head_s, smooth_ms, (x, y)) analysis axis for stitch
+_prep_cache = None       # (head_s, smooth_ms, [(x, y, label, trace)]) per trace
+_band_placed = False     # Y-range band placed (auto or by the user)?
 
 
 def _tint(hexcolor, alpha):
@@ -1070,18 +1081,73 @@ def _tint(hexcolor, alpha):
     return pg.mkBrush(c)
 
 
-def analysis_segments(stride=1):
-    """(t, y) pairs of the displayed traces for heka.analysis.
+def analysis_segments(stride=1, head_s=0.0, smooth_ms=0.0):
+    """(t, y) segments for heka.analysis.
 
-    Per trace on purpose: sweeps of one series share their time axis, so
-    concatenating them would fabricate events at the junctions.
+    Default: one segment per displayed trace -- sweeps of one series share
+    their time axis, so blind concatenation would fabricate events at the
+    junctions. With Stitch on, the traces are instead concatenated on their
+    true acquisition timeline (each trace's first head_s seconds sliced off
+    to drop the capacitor transient), so a level sojourn that outlives a
+    single sweep is detected as ONE event instead of being cut at every
+    sweep boundary.
+
+    smooth_ms > 0 median-compresses each trace into disjoint windows of
+    that width before detection: spikes narrower than the window are
+    crushed while second-scale level plateaus survive, so spike-riddled
+    two-state traces can be analysed at all. The decimated time axis uses
+    window centres; everything downstream (detection, dwell) lives on it.
     """
+    global _stitch_cache, _prep_cache
+    prepped = _prepped(head_s, smooth_ms)
+    if _stitch_active and prepped:
+        if (_stitch_cache is None
+                or _stitch_cache[:3] != (id(last_data), head_s, smooth_ms)):
+            xs, ys, t = [], [], None
+            for x, y, label, trace in prepped:
+                if t is None:
+                    t = float(x[0]) if len(x) else 0.0
+                # spacing of the (possibly decimated) prepped arrays
+                dt = float(np.mean(np.diff(x))) if len(x) > 1 \
+                    else float(trace.XInterval)
+                xs.append(t + np.arange(len(y)) * dt)
+                ys.append(y)
+                t += len(y) * dt
+            _stitch_cache = (id(last_data), head_s, smooth_ms,
+                             (np.concatenate(xs), np.concatenate(ys)))
+        x, y = _stitch_cache[3]
+        if stride > 1:
+            x, y = x[::stride], y[::stride]
+        return [(x, y)]
     segs = []
-    for x, y, label, trace in last_data:
+    for x, y, label, trace in prepped:
         if stride > 1:
             x, y = x[::stride], y[::stride]
         segs.append((x, y))
     return segs
+
+
+def _prepped(head_s, smooth_ms):
+    """Per-trace detection arrays: transient head sliced, optional median
+    decimation applied; cached per (last_data, head_s, smooth_ms)."""
+    global _prep_cache
+    key = (id(last_data), head_s, smooth_ms)
+    if _prep_cache is None or _prep_cache[:3] != key:
+        out = []
+        for x, y, label, trace in last_data:
+            dt = float(trace.XInterval)
+            k = int(round(head_s / dt)) if dt > 0 else 0
+            if k:
+                x, y = x[k:], y[k:]
+            w = max(1, int(round(smooth_ms * 1e-3 / dt))) if dt > 0 else 1
+            m = (len(y) // w) * w
+            if w > 1 and m >= w:
+                y = np.median(y[:m].reshape(-1, w), axis=1)
+                x = x[:m].reshape(-1, w).mean(axis=1)     # window centres
+            if len(y):
+                out.append((x, y, label, trace))
+        _prep_cache = key + (out,)
+    return _prep_cache[3]
 
 
 def total_points():
@@ -1212,8 +1278,10 @@ evt_lay.addLayout(evt_ctrl0)
 evt_ctrl1 = pg.QtWidgets.QHBoxLayout()          # workflow step 1: the Y range
 evt_lo = NumericEdit(0.0, -1e6, 1e6)
 evt_hi = NumericEdit(1.0, -1e6, 1e6)
+evt_ylab = pg.QtWidgets.QLabel('(%s)' % cur_yunit)
+evt_lo.setToolTip('Y 范围下沿，单位自动取可读的 SI 前缀（如 pA），与图上带子双向同步')
 for _w in (pg.QtWidgets.QLabel('<b>Y 范围</b>  lo'), evt_lo,
-           pg.QtWidgets.QLabel('–  hi'), evt_hi,
+           pg.QtWidgets.QLabel('–  hi'), evt_hi, evt_ylab,
            pg.QtWidgets.QLabel('<span style="color:#999">(与主图青色带双向同步，可直接输入)</span>')):
     evt_ctrl1.addWidget(_w)
 evt_ctrl1.addStretch(1)
@@ -1228,14 +1296,42 @@ evt_tmin = NumericEdit(float(settings.value('dist/t_min', 3.0, type=float)),
                        0.0, 1e6)
 evt_merge = NumericEdit(float(settings.value('dist/merge', 0.0, type=float)),
                         0.0, 1e4)
+evt_head = NumericEdit(float(settings.value('dist/head', 10.0, type=float)),
+                       0.0, 1e4)
+evt_smooth = NumericEdit(float(settings.value('dist/smooth', 0.0, type=float)),
+                         0.0, 1e4)
+evt_duty = NumericEdit(float(settings.value('dist/duty', 0.5, type=float)),
+                       0.0, 1.0)
 evt_ccdf = pg.QtWidgets.QCheckBox('1-CDF (log-log)')
+evt_ccdf.setChecked(settings.value('dist/ccdf', False, type=bool))
 for _w in (pg.QtWidgets.QLabel('<b>边沿判定</b>  模式'), evt_mode,
            pg.QtWidgets.QLabel('滞回 k·σ'), evt_k,
            pg.QtWidgets.QLabel('最短 (点)'), evt_tmin,
-           pg.QtWidgets.QLabel('合并 (s)'), evt_merge, evt_ccdf):
+           pg.QtWidgets.QLabel('合并 (s)'), evt_merge,
+           pg.QtWidgets.QLabel('忽略开头 (ms)'), evt_head,
+           pg.QtWidgets.QLabel('检测平滑 (ms)'), evt_smooth,
+           pg.QtWidgets.QLabel('带内占比 ≥'), evt_duty, evt_ccdf):
     evt_ctrl2.addWidget(_w)
 evt_ctrl2.addStretch(1)
 evt_lay.addLayout(evt_ctrl2)
+evt_mode.setToolTip('inside = 带内即事件（默认，不假定基线）\n'
+                    'outside = 带外即事件（上下双向尖峰）\n'
+                    'below = y < hi 即事件（向下阻断）\n'
+                    'above = y > lo 即事件（向上尖峰）')
+evt_k.setToolTip('事件结束要求信号明确离开带宽 k·σ（σ 自动估计），\n'
+                 '防止噪声在带沿反复进出把一个事件拆成多个；0 = 关闭滞回')
+evt_tmin.setToolTip('短于该采样点数（原始采样率计）的事件丢弃（去毛刺）')
+evt_merge.setToolTip('间隔小于该值的事件合并回一个（用于重连被 spike 打断的态驻留）。\n'
+                     '⚠ 过大会把高频 spike 的顶部碎片串接成假长事件——\n'
+                     'spike 密集的数据请改用「检测平滑」+「带内占比」')
+evt_head.setToolTip('忽略每条曲线开头这段时间（电容充放电瞬态）。\n'
+                    'Stitch 模式下每条 sweep 的开头都会被切掉')
+evt_smooth.setToolTip('检测前把每条曲线按该窗宽做中位数压缩：\n'
+                      '比窗窄的 spike 被压掉，秒级电平台完整保留。\n'
+                      'spike 密集的两态数据建议 1–2 ms；0 = 关闭。\n'
+                      '「最短 (点)」始终按原始采样率计，无需换算')
+evt_duty.setToolTip('合并后事件跨度内、真正在带内的时间占比低于该值即丢弃。\n'
+                    'spike 顶部碎片链占比 ~3%，真实态驻留 >50% —— 一刀分开')
 
 evt_ctrl3 = pg.QtWidgets.QHBoxLayout()          # workflow step 3: the result
 evt_headline = pg.QtWidgets.QLabel('')
@@ -1385,6 +1481,8 @@ def run_detection(full=True):
     land in the stats label instead of a dialog.
     """
     global _evt_overlays, _last_events, _last_labels
+    f, prefix = _yunit_scale()
+    evt_ylab.setText('(%s%s)' % (prefix, cur_yunit))
     pi = plot.getPlotItem()
     for it in _evt_overlays:
         if it.scene() is not None:
@@ -1402,21 +1500,31 @@ def run_detection(full=True):
         return
     band_region.show()
     lo, hi = band_region.getRegion()
+    head_s = evt_head.value() * 1e-3
+    smooth_ms = evt_smooth.value()
+    # 「最短 (点)」按原始采样率计；平滑压缩后检测序列变稀，需要换算
+    w = 1
+    if last_data and smooth_ms > 0:
+        dt0 = float(last_data[0][3].XInterval)
+        if dt0 > 0:
+            w = max(1, int(round(smooth_ms * 1e-3 / dt0)))
+    t_min_dec = max(1, int(round(evt_tmin.value() / w)))
     total = total_points()
     stride = 1 if full else max(1, total // 200000)
-    segs = analysis_segments(stride)
+    segs = analysis_segments(stride, head_s=head_s, smooth_ms=smooth_ms)
     # the overlay is a visual indicator only: cap it to ~2M points so a
     # whole-Group view (tens of millions of samples) stays fluid. Detection
     # and all statistics below always run on the full-resolution segs.
     if stride == 1 and total > 2000000:
-        osegs = analysis_segments(max(1, total // 2000000))
+        osegs = analysis_segments(max(1, total // 2000000), head_s=head_s,
+                                  smooth_ms=smooth_ms)
     else:
         osegs = segs
     try:
         res = analysis.detect_events_segments(
             segs, mode=evt_mode.currentText(), lo=lo, hi=hi, h=None,
-            k=evt_k.value(), t_min=int(round(evt_tmin.value())),
-            merge_gap=evt_merge.value())
+            k=evt_k.value(), t_min=t_min_dec,
+            merge_gap=evt_merge.value(), duty_min=evt_duty.value())
     except ValueError as exc:
         dwell_plot.getPlotItem().clear()
         level_plot.getPlotItem().clear()
@@ -1469,6 +1577,10 @@ def run_detection(full=True):
     if res.boundary_discarded:
         notes.append('%d 个边界事件被丢弃（进入或离开未被观测到，即事件跨越数据首尾）'
                      % res.boundary_discarded)
+    if res.duty_discarded:
+        notes.append('%d 个合并事件因带内占比 < %.0f%% 被丢弃'
+                     '（多为 spike 顶部碎片链）'
+                     % (res.duty_discarded, evt_duty.value() * 100))
     evt_stats.setText(txt + '<br>' + '<br>'.join(notes))
 
 
@@ -1480,24 +1592,31 @@ def clear_analysis():
     amp_recompute()
 
 
+def _place_band():
+    """Auto-place the Y-range band on the event side of the amplitude
+    distribution -- never on the baseline: an inside-mode band hugging the
+    baseline flags half the trace as "events" (the G0 S19 green-wash bug).
+    No-op without data; remembers that the band was placed."""
+    global _band_placed
+    if not last_data:
+        return
+    pooled = np.concatenate([y[::max(1, len(y) // 100000)]
+                             for _, y, _, _ in last_data])
+    p1, p25, p50, p75, p99 = np.percentile(pooled, [1, 25, 50, 75, 99])
+    if p99 - p50 >= p50 - p1:
+        rng = (float(p75), float(p99))            # heavier upper tail
+    else:
+        rng = (float(p1), float(p25))             # heavier lower tail
+    if rng[1] > rng[0]:
+        band_region.setRegion(rng)
+        _band_placed = True
+
+
 def detect_toggled(checked):
-    settings.setValue('dist/enabled', checked)
     if checked:
         if sec_dist.is_collapsed():
             sec_dist.set_collapsed(False)
-        if last_data:
-            # Place the band on the EVENT side of the amplitude distribution,
-            # never on the baseline: an inside-mode band hugging the baseline
-            # flags half the trace as "events" (the G0 S19 green-wash bug).
-            pooled = np.concatenate([y[::max(1, len(y) // 100000)]
-                                     for _, y, _, _ in last_data])
-            p1, p25, p50, p75, p99 = np.percentile(pooled, [1, 25, 50, 75, 99])
-            if p99 - p50 >= p50 - p1:
-                rng = (float(p75), float(p99))    # heavier upper tail
-            else:
-                rng = (float(p1), float(p25))     # heavier lower tail
-            if rng[1] > rng[0]:
-                band_region.setRegion(rng)
+        _place_band()
     run_detection()
 
 
@@ -1558,25 +1677,57 @@ def _remove_region(r):
 
 _band_syncing = False
 
+_yunit_cache = None   # (id(last_data), factor, si_prefix)
+
+
+def _yunit_scale():
+    """(factor, prefix) for the Y-range fields: an SI prefix chosen so the
+    band numbers are readable (an A-native trace is edited in pA)."""
+    global _yunit_cache
+    if _yunit_cache is None or _yunit_cache[0] != id(last_data):
+        f, prefix = 1.0, ''
+        if last_data:
+            y0 = last_data[0][1]
+            ref = float(np.nanmedian(np.abs(y0[:min(100000, len(y0))])))
+            if ref > 0 and np.isfinite(ref):
+                for _ in range(9):
+                    if abs(ref / f) >= 1 and abs(ref / f) < 1000:
+                        break
+                    nf = f * 1e3 if abs(ref / f) >= 1000 else f * 1e-3
+                    if nf == f:
+                        break
+                    f, prefix = nf, {1e-12: 'p', 1e-9: 'n', 1e-6: 'u',
+                                     1e-3: 'm', 1.0: '', 1e3: 'k',
+                                     1e6: 'M'}.get(f, prefix)
+                prefix = {1e-12: 'p', 1e-9: 'n', 1e-6: 'u', 1e-3: 'm',
+                          1.0: '', 1e3: 'k', 1e6: 'M'}.get(f, '')
+        _yunit_cache = (id(last_data), f, prefix)
+    return _yunit_cache[1], _yunit_cache[2]
+
 
 def _sync_fields_from_band(*_):
+    global _band_placed
+    _band_placed = True                       # the band was moved: user intent
     if _band_syncing:
         return
     lo, hi = band_region.getRegion()
-    evt_lo.setText(evt_lo._fmt(lo))
-    evt_hi.setText(evt_hi._fmt(hi))
+    f, _ = _yunit_scale()
+    evt_lo.setText(evt_lo._fmt(lo / f))       # native axis -> display unit
+    evt_hi.setText(evt_hi._fmt(hi / f))
 
 
 def _sync_band_from_fields(*_):
-    global _band_syncing
+    global _band_syncing, _band_placed
     if _band_syncing:
         return
     lo, hi = sorted((evt_lo.value(), evt_hi.value()))
     if not hi > lo:
         return
+    f, _ = _yunit_scale()
     _band_syncing = True
+    _band_placed = True
     try:
-        band_region.setRegion((lo, hi))
+        band_region.setRegion((lo * f, hi * f))   # display unit -> native axis
         run_detection()
     finally:
         _band_syncing = False
@@ -1680,6 +1831,9 @@ evt_mode.currentIndexChanged.connect(lambda *_: run_detection())
 evt_k._cb = lambda *_: run_detection()
 evt_tmin._cb = lambda *_: run_detection()
 evt_merge._cb = lambda *_: run_detection()
+evt_head._cb = lambda *_: run_detection()
+evt_smooth._cb = lambda *_: run_detection()
+evt_duty._cb = lambda *_: run_detection()
 evt_ccdf.toggled.connect(lambda *_: run_detection())
 evt_lo._cb = _sync_band_from_fields
 evt_hi._cb = _sync_band_from_fields
@@ -1696,13 +1850,13 @@ amp_add_btn.toggled.connect(amp_add_toggled)
 evt_enable.toggled.connect(detect_toggled)
 
 
-# initial hints + persisted state (the Add-region drag mode is deliberately
-# NOT persisted -- like Measure -- so the plot always pans on a fresh start)
+# initial hints + persisted state. Deliberately NOT persisted: the
+# Enable Detection toggle (a leftover "ghost state" used to re-enable
+# detection with an unplaced sentinel band on every launch) and the
+# Add-region drag mode -- the app always starts clean, like Measure.
 run_detection()
 amp_recompute()
 _refresh_region_list()
-evt_ccdf.setChecked(settings.value('dist/ccdf', False, type=bool))
-evt_enable.setChecked(settings.value('dist/enabled', False, type=bool))
 
 # load Heka's demo bundle if it is present
 demo = 'DemoV9Bundle.dat'
@@ -1746,6 +1900,9 @@ def _save_layout():
     settings.setValue('dist/k', evt_k.value())
     settings.setValue('dist/t_min', evt_tmin.value())
     settings.setValue('dist/merge', evt_merge.value())
+    settings.setValue('dist/head', evt_head.value())
+    settings.setValue('dist/smooth', evt_smooth.value())
+    settings.setValue('dist/duty', evt_duty.value())
     settings.setValue('dist/ccdf', evt_ccdf.isChecked())
     settings.setValue('amp/bins_auto', amp_auto_bins.isChecked())
     settings.setValue('amp/bins', amp_bins.value())
