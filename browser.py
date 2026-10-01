@@ -1418,6 +1418,14 @@ for _key in (pg.QtCore.Qt.Key_Delete, pg.QtCore.Qt.Key_Backspace):
 _bundle_cache = {}       # abspath -> Bundle, LRU (multi-document tabs)
 
 
+def _bundle_cache_put(path, bundle):
+    """Insert into the 2-entry LRU (most recent last)."""
+    _bundle_cache.pop(path, None)
+    _bundle_cache[path] = bundle
+    while len(_bundle_cache) > 2:
+        _bundle_cache.pop(next(iter(_bundle_cache)))
+
+
 def load(file_name):
     """Load a new .dat file into the browser. The parsed bundle is
     LRU-cached (2 entries): switching document tabs between two files
@@ -1427,14 +1435,11 @@ def load(file_name):
     file_name = os.path.abspath(file_name)
     bundle = _bundle_cache.get(file_name)
     if bundle is not None:
-        _bundle_cache.pop(file_name)
-        _bundle_cache[file_name] = bundle          # LRU touch
+        _bundle_cache_put(file_name, bundle)       # LRU touch
     else:
         # Read the bundle header (no data is read at this time)
         bundle = heka_reader.Bundle(file_name)
-        _bundle_cache[file_name] = bundle
-        while len(_bundle_cache) > 2:
-            _bundle_cache.pop(next(iter(_bundle_cache)))
+        _bundle_cache_put(file_name, bundle)
     _loaded_file = file_name
     _loaded_fp = _file_fp(file_name)
     settings.setValue('last_dir', os.path.dirname(file_name))
@@ -1501,10 +1506,7 @@ def _reload_file(silent=False):
         new_bundle = heka_reader.Bundle(_loaded_file)
         new_bundle.pul          # force the .pul parse NOW: a truncated
         bundle = new_bundle     # tail must raise here, not on first click
-        _bundle_cache.pop(_loaded_file, None)     # on-disk change: evict
-        _bundle_cache[_loaded_file] = new_bundle
-        while len(_bundle_cache) > 2:
-            _bundle_cache.pop(next(iter(_bundle_cache)))
+        _bundle_cache_put(_loaded_file, new_bundle)  # on-disk change: evict
         _file_fp_cache.pop(_loaded_file, None)    # content changed: rehash
         _loaded_fp = _file_fp(_loaded_file)
     except Exception:
@@ -1524,12 +1526,17 @@ def _reload_file(silent=False):
     return True
 
 
+def _watch_set(watcher, path):
+    """Point `watcher` at exactly `path` (falsy -> watch nothing)."""
+    for p in list(watcher.files()) + list(watcher.directories()):
+        watcher.removePath(p)
+    if path:
+        watcher.addPath(path)
+
+
 def _watch_switch(path):
     """Point the watcher at exactly one path."""
-    for p in list(_watcher.files()):
-        _watcher.removePath(p)
-    if path:
-        _watcher.addPath(path)
+    _watch_set(_watcher, path)
 
 
 def _follow_toggled(checked):
@@ -2343,10 +2350,7 @@ def _exp_refresh():
 
 
 def _exp_watch_switch(path):
-    for p in list(exp_watcher.directories()):
-        exp_watcher.removePath(p)
-    if path:
-        exp_watcher.addPath(path)
+    _watch_set(exp_watcher, path)
 
 
 def _exp_set_root(path, save=True):
@@ -2626,11 +2630,22 @@ def _grab_detach_rects():
             pi.removeItem(roi)
 
 
+def _grab_clear_state():
+    """Drop ALL in-memory grab state (rows / groups / rects / selection)."""
+    global grab_records, _grab_groups, _grab_rects
+    global _grab_selected, _grab_focus_gid
+    _grab_detach_rects()
+    grab_records = []
+    _grab_groups = {}
+    _grab_rects = {}
+    _grab_selected = None
+    _grab_focus_gid = None
+    _grab_items.clear()
+
+
 def _doc_state_capture():
     """Globals -> the active document's session slot. Rects are detached
     from the plot; tree rows are rebuilt on restore."""
-    global grab_records, _grab_groups, _grab_rects
-    global _grab_selected, _grab_focus_gid
     if _doc is _DOC_CLOSED:
         return
     _grab_detach_rects()
@@ -2639,12 +2654,7 @@ def _doc_state_capture():
         selected=_grab_selected, focus=_grab_focus_gid,
         next_eid=_grab_next_eid[0], next_gid=_grab_next_gid[0],
         params=_grab_params())
-    grab_records = []
-    _grab_groups = {}
-    _grab_rects = {}
-    _grab_selected = None
-    _grab_focus_gid = None
-    _grab_items.clear()
+    _grab_clear_state()
 
 
 def _doc_state_restore():
@@ -2714,15 +2724,7 @@ def _doc_open_untitled():
 def _reset_grab_globals():
     """Drop ALL active grab state (rows / groups / rects / selection)
     without touching the document bookkeeping."""
-    global grab_records, _grab_groups, _grab_rects
-    global _grab_selected, _grab_focus_gid
-    _grab_detach_rects()
-    grab_records = []
-    _grab_groups = {}
-    _grab_rects = {}
-    _grab_selected = None
-    _grab_focus_gid = None
-    _grab_items.clear()
+    _grab_clear_state()
     _refresh_grab_list()
 
 
