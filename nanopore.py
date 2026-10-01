@@ -1,7 +1,5 @@
 import math
 
-MEMBRANE_THICKNESS_DEFAULT = 20.0
-
 CONDUCTIVITY_TABLE = {
     "KCl": [
         (0.001, 0.0147),

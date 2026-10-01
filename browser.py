@@ -1072,7 +1072,7 @@ def drag_measure_show(p0, p1):
 measure_btn.toggled.connect(measure_toggled)
 clear_btn.clicked.connect(clear_meas)
 plot.scene().sigMouseClicked.connect(plot_clicked)
-proxy = pg.SignalProxy(plot.scene().sigMouseMoved, rateLimit=60, slot=mouse_moved)
+_mouse_proxy = pg.SignalProxy(plot.scene().sigMouseMoved, rateLimit=60, slot=mouse_moved)  # keep a ref: SignalProxy must stay alive
 
 
 # --- Nanopore size calculator dialog ------------------------------------------
@@ -1778,7 +1778,6 @@ last_data = []           # (x, y, label, trace) of every displayed trace
 last_data_idx = []       # tree index tuple per displayed trace (aligned)
 amp_regions = []         # committed time-region items
 _pending_region = None   # region currently being rubber-band dragged
-_evt_overlays = []       # event highlight curves in the main plot
 _join_active = False   # Join on -> detection runs on the continuous axis
 _join_cache = None     # (_data_stamp, head_s, smooth_ms, (x, y)) join axis
 _prep_cache = None       # (_data_stamp, head_s, smooth_ms, [...]) per trace
@@ -4406,14 +4405,6 @@ def _grab_row(rec, rank):
     return ['%d' % rank, fmt_si(rec['t_start'], 's'),
             fmt_si(rec['dwell'], 's'), fmt_si(rec['y_level'], cur_yunit),
             '±' + fmt_si(rec['sigma'], cur_yunit), '']
-
-
-def _grab_row_update(rec):
-    it = _grab_items.get(rec['id'])
-    if it is None:
-        return
-    for c, txt in enumerate(_grab_row(rec, _grab_rank_of(rec))):
-        it.setText(c, txt)
 
 
 def _grab_apply_selection_style():
