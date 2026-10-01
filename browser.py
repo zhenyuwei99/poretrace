@@ -617,18 +617,18 @@ left_lay.addWidget(vsplit, 1, 0)
 
 # Fixed-height button rows (not part of the vertical splitter)
 btn_row = pg.QtWidgets.QWidget()
-w1l = pg.QtWidgets.QGridLayout()
-w1l.setContentsMargins(0, 0, 0, 0)
-btn_row.setLayout(w1l)
+btn_row_lay = pg.QtWidgets.QGridLayout()
+btn_row_lay.setContentsMargins(0, 0, 0, 0)
+btn_row.setLayout(btn_row_lay)
 left_lay.addWidget(btn_row, 0, 0)
 
 # Button for loading .dat file
 load_btn = pg.QtWidgets.QPushButton(T('btn.load'))
-w1l.addWidget(load_btn, 0, 0)
+btn_row_lay.addWidget(load_btn, 0, 0)
 
 # Button to auto-fit X/Y axes to the displayed data
 auto_btn = pg.QtWidgets.QPushButton(T('btn.auto'))
-w1l.addWidget(auto_btn, 0, 1)
+btn_row_lay.addWidget(auto_btn, 0, 1)
 
 # Checkable follow mode: watch the loaded .dat on disk and re-parse it
 # whenever Patchmaster appends data (near-live feedback per sweep); F5 is
@@ -636,16 +636,16 @@ w1l.addWidget(auto_btn, 0, 1)
 follow_btn = pg.QtWidgets.QPushButton(T('btn.follow'))
 follow_btn.setCheckable(True)
 follow_btn.setToolTip(T('tip.follow'))
-w1l.addWidget(follow_btn, 0, 2)
+btn_row_lay.addWidget(follow_btn, 0, 2)
 
 # Checkable button toggling click-to-measure mode on the plot
 measure_btn = pg.QtWidgets.QPushButton(T('btn.measure'))
 measure_btn.setCheckable(True)
-w1l.addWidget(measure_btn, 1, 0)
+btn_row_lay.addWidget(measure_btn, 1, 0)
 
 # Button clearing all measurement markers
 clear_btn = pg.QtWidgets.QPushButton(T('btn.clear'))
-w1l.addWidget(clear_btn, 1, 1)
+btn_row_lay.addWidget(clear_btn, 1, 1)
 
 # Checkable button toggling end-to-end joining of multi-selected traces
 join_btn = pg.QtWidgets.QPushButton(T('btn.join'))
@@ -655,13 +655,13 @@ _join_saved = settings.value('join', None)
 if _join_saved is None:
     _join_saved = settings.value('stitch', False, type=bool)
 join_btn.setChecked(bool(_join_saved))
-w1l.addWidget(join_btn, 1, 2, 1, 2)
+btn_row_lay.addWidget(join_btn, 1, 2, 1, 2)
 
 # Language switch: writes ui/lang and offers a restart (the whole UI is
 # built at module level, so the new language lands on the next launch)
 lang_btn = pg.QtWidgets.QPushButton('EN' if _ui_lang == 'zh' else '中文')
 lang_btn.setToolTip(T('btn.tip.lang'))
-w1l.addWidget(lang_btn, 0, 3)
+btn_row_lay.addWidget(lang_btn, 0, 3)
 
 
 def _lang_clicked():
@@ -797,8 +797,8 @@ auto_btn.clicked.connect(auto_clicked)
 
 # --- Measure mode: live crosshair + two-point (A/B) delta readout -------------
 
-vLine = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen(THEME['crosshair'], width=1, style=pg.QtCore.Qt.DashLine))
-hLine = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen(THEME['crosshair'], width=1, style=pg.QtCore.Qt.DashLine))
+v_line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen(THEME['crosshair'], width=1, style=pg.QtCore.Qt.DashLine))
+h_line = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen(THEME['crosshair'], width=1, style=pg.QtCore.Qt.DashLine))
 
 # Floating readout (cursor / A / B / delta) anchored to the top-left of the
 # view: no layout impact on the traces and never clipped
@@ -839,7 +839,7 @@ bundle = None
 def add_crosshair():
     """Re-attach crosshair lines to the plot (plot.clear() detaches them)."""
     pi = plot.getPlotItem()
-    for ln in (vLine, hLine):
+    for ln in (v_line, h_line):
         pi.addItem(ln, ignoreBounds=True)
         ln.setVisible(measure_btn.isChecked())
 
@@ -962,8 +962,8 @@ def clear_meas():
 
 
 def measure_toggled(checked):
-    vLine.setVisible(checked)
-    hLine.setVisible(checked)
+    v_line.setVisible(checked)
+    h_line.setVisible(checked)
     # no exclusivity needed any more: Measure owns plain drag, the
     # analysis tabs own Shift+drag -- they can be on at the same time
     if not checked:
@@ -978,7 +978,6 @@ def plot_clicked(ev):
         return
     if ev.button() != pg.QtCore.Qt.LeftButton or ev.double():
         return
-    vb = plot.getPlotItem().getViewBox()
     if not vb.sceneBoundingRect().contains(ev.scenePos()):
         return
     if len(meas_points) >= 2:
@@ -1008,12 +1007,11 @@ def mouse_moved(evt):
     last_mouse = pg.QtCore.QPointF(pos)
     if not measure_btn.isChecked():
         return
-    vb = plot.getPlotItem().getViewBox()
     if not vb.sceneBoundingRect().contains(pos):
         return
     vpos = vb.mapSceneToView(pos)
-    vLine.setPos(vpos.x())
-    hLine.setPos(vpos.y())
+    v_line.setPos(vpos.x())
+    h_line.setPos(vpos.y())
     best = nearest_on_curves(vpos)
     last_snap = None
     name = ''
@@ -4270,12 +4268,12 @@ def _grab_show_overlays():
         _grab_overlays.append(_grab_add_event_curve(pi, x, y, 3))
 
 
-_VIEWALL_MIN_CAP = 64       # per-event floor in audit mode (slivers stay visible)
-_VIEWALL_PTS_PER_PX = 2.5   # audit decimation density vs on-screen event width
-_viewall_cache = [None, None, None, None]   # base fingerprint, X, Y, span
+_GRAB_VIEWALL_MIN_CAP = 64       # per-event floor in audit mode (slivers stay visible)
+_GRAB_VIEWALL_PTS_PER_PX = 2.5   # audit decimation density vs on-screen event width
+_grab_viewall_cache = [None, None, None, None]   # base fingerprint, X, Y, span
 
 
-def _viewall_span():
+def _grab_viewall_span():
     """Width of the main plot's current x view, in data units (0 = unknown)."""
     try:
         return float(plot.getPlotItem().viewRect().width())
@@ -4289,8 +4287,8 @@ def _grab_viewall_arrays(rec):
     top), groupless imports via _grab_selected_span (selected EXCLUDED, it
     draws its own bold curve) -- each cropped (iron rule 1: _grab_crop
     searchsorted, never segment-length arrays) and envelope-decimated
-    (rule 2, VIEW-SCALE-AWARE cap: _VIEWALL_PTS_PER_PX points per pixel of
-    the event's on-screen width, floored at _VIEWALL_MIN_CAP -- at a full
+    (rule 2, VIEW-SCALE-AWARE cap: _GRAB_VIEWALL_PTS_PER_PX points per pixel of
+    the event's on-screen width, floored at _GRAB_VIEWALL_MIN_CAP -- at a full
     130 s view a 17 ms event is a 0.16 px sliver and 64 points already
     overresolve it; zoomed in the cap grows to _EVENT_CURVE_CAP for full
     fidelity), then concatenated with NaN separators into ONE array for
@@ -4303,27 +4301,27 @@ def _grab_viewall_arrays(rec):
     count+id sum -- rows are only ever added/removed, ids are unique
     integers so count+sum is order-free and complete -- live group event
     counts); the stored span tolerates 1.5x drift, so PANS are pure cache
-    hits and only a real zoom (beyond 1.5x, debounced by _viewall_timer)
+    hits and only a real zoom (beyond 1.5x, debounced by _grab_viewall_timer)
     rebuilds."""
-    span = _viewall_span()
+    span = _grab_viewall_span()
     base_fp = (_data_stamp, len(grab_records),
                sum(r['id'] for r in grab_records),
                tuple((gid, len(g['events'])) for gid, g
                      in sorted(_grab_groups.items())
                      if _grab_grp_matches(g)))
-    if _viewall_cache[0] == base_fp and _viewall_cache[1] is not None:
-        old = _viewall_cache[3]
+    if _grab_viewall_cache[0] == base_fp and _grab_viewall_cache[1] is not None:
+        old = _grab_viewall_cache[3]
         if not (span > 0 and old > 0) \
                 or (span <= 1.5 * old and old <= 1.5 * span):
-            return _viewall_cache[1], _viewall_cache[2]
+            return _grab_viewall_cache[1], _grab_viewall_cache[2]
     vw = max(1.0, float(plot.width()))
     parts_x, parts_y = [], []
 
     def _add(x, y):
         dur = float(x[-1] - x[0]) if len(x) > 1 else 0.0
         cap = (_EVENT_CURVE_CAP if span <= 0
-               else int(_VIEWALL_PTS_PER_PX * dur * vw / span))
-        cap = max(_VIEWALL_MIN_CAP, min(_EVENT_CURVE_CAP, cap))
+               else int(_GRAB_VIEWALL_PTS_PER_PX * dur * vw / span))
+        cap = max(_GRAB_VIEWALL_MIN_CAP, min(_EVENT_CURVE_CAP, cap))
         if len(y) > cap:
             x, y = _peak_decimate(x, y, cap)
         parts_x.append(x)
@@ -4340,40 +4338,40 @@ def _grab_viewall_arrays(rec):
         for x, y in _grab_selected_span(r):
             _add(x, y)
     if not parts_x:
-        _viewall_cache[:] = [base_fp, None, None, span]
+        _grab_viewall_cache[:] = [base_fp, None, None, span]
         return None, None
     nan = np.full(1, np.nan)
     xs = [v for pair in ([nan, p] for p in parts_x) for v in pair][1:]
     ys = [v for pair in ([nan, p] for p in parts_y) for v in pair][1:]
-    _viewall_cache[:] = [base_fp, np.concatenate(xs), np.concatenate(ys),
+    _grab_viewall_cache[:] = [base_fp, np.concatenate(xs), np.concatenate(ys),
                          span]
-    return _viewall_cache[1], _viewall_cache[2]
+    return _grab_viewall_cache[1], _grab_viewall_cache[2]
 
 
-def _viewall_zoom_rebuild():
+def _grab_viewall_zoom_rebuild():
     """Debounced sigRangeChanged follow-up: rebuild the merged audit curve
     only when the view actually changed scale beyond the cache's 1.5x
     tolerance (pans keep the span -- pure cache hits, nothing to do)."""
     if not (grab_viewall_btn.isChecked() and _grab_active()):
         return
-    span = _viewall_span()
-    old = _viewall_cache[3]
+    span = _grab_viewall_span()
+    old = _grab_viewall_cache[3]
     if span > 0 and old > 0 and (span > 1.5 * old or old > 1.5 * span):
         _grab_show_overlays()
 
 
-_viewall_timer = pg.QtCore.QTimer(singleShot=True)
-_viewall_timer.setInterval(150)
-_viewall_timer.timeout.connect(_viewall_zoom_rebuild)
+_grab_viewall_timer = pg.QtCore.QTimer(singleShot=True)
+_grab_viewall_timer.setInterval(150)
+_grab_viewall_timer.timeout.connect(_grab_viewall_zoom_rebuild)
 
 
-def _viewall_range_debounced(*_a):
+def _grab_viewall_range_debounced(*_a):
     if grab_viewall_btn.isChecked() and _grab_active():
-        _viewall_timer.start()
+        _grab_viewall_timer.start()
 
 
 plot.getPlotItem().getViewBox().sigRangeChanged.connect(
-    _viewall_range_debounced)
+    _grab_viewall_range_debounced)
 
 
 def _grab_selected_span(rec):
