@@ -2675,8 +2675,6 @@ def _doc_state_restore():
     _grab_items.clear()
     p = dict(st.get('params') or {})
     if p:
-        p.setdefault('head', p.get('head_ms'))
-        p.setdefault('smooth', p.get('smooth_ms'))
         _apply_doc_params(p)
     _refresh_grab_list()
     _grab_refresh_views()
@@ -4783,6 +4781,13 @@ def _parse_csv_params(path):
                         params = kv
     except OSError:
         return None
+    if params is not None:
+        # CSV header carries the short file-format keys; internal param
+        # dicts are uniformly head_ms / smooth_ms.
+        if 'head' in params:
+            params['head_ms'] = params.pop('head')
+        if 'smooth' in params:
+            params['smooth_ms'] = params.pop('smooth')
     return params
 
 
@@ -4801,8 +4806,8 @@ def _apply_doc_params(params):
     num('k', grab_k)
     num('t_min_ms', grab_tmin)
     num('merge', grab_merge)
-    num('head', grab_head)
-    num('smooth', grab_smooth)
+    num('head_ms', grab_head)
+    num('smooth_ms', grab_smooth)
     num('duty', grab_duty)
 
 
