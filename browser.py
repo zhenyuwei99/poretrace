@@ -462,6 +462,27 @@ def T(key, **fmt):
     return s.format(**fmt) if fmt else s
 
 
+def _splitter_assign(widget, want):
+    """Give `widget` `want` px in its parent splitter, handing the
+    difference to the widest sibling so the sizes still sum to the
+    splitter's width: a lopsided request makes QSplitter redistribute
+    the surplus per size hints, which is how panes spring back open."""
+    sp = widget.parentWidget()
+    if not isinstance(sp, pg.QtWidgets.QSplitter):
+        return
+    idx = sp.indexOf(widget)
+    sizes = sp.sizes()
+    delta = int(want) - sizes[idx]
+    if not delta:
+        return
+    sizes[idx] += delta
+    k = max((j for j in range(len(sizes)) if j != idx),
+            key=lambda j: sizes[j], default=None)
+    if k is not None:
+        sizes[k] -= delta
+    sp.setSizes([int(s) for s in sizes])
+
+
 # Configure Qt GUI:
 
 # Collapsible titled section: a one-line header with a fold arrow; folding
@@ -504,21 +525,9 @@ class Collapsible(pg.QtWidgets.QWidget):
             self.setMaximumHeight(self.btn.sizeHint().height() + 4)
         else:
             self.setMaximumHeight(16777215)
-        if isinstance(sp, pg.QtWidgets.QSplitter):
-            idx = sp.indexOf(self)
-            sizes = sp.sizes()
-            strip = self.btn.sizeHint().height() + 4   # keep header clickable
-            want = strip if collapsed else (getattr(self, '_restore', 0) or 150)
-            delta = int(want) - sizes[idx]
-            sizes[idx] += delta
-            if delta:
-                # keep the list summing to the splitter's height (see the
-                # sideways twin CollapsibleColumn for the rationale)
-                k = max((j for j in range(len(sizes)) if j != idx),
-                        key=lambda j: sizes[j], default=None)
-                if k is not None:
-                    sizes[k] -= delta
-            sp.setSizes([int(s) for s in sizes])
+        strip = self.btn.sizeHint().height() + 4   # keep header clickable
+        _splitter_assign(self, strip if collapsed
+                         else (getattr(self, '_restore', 0) or 150))
 
     def is_collapsed(self):
         return self._collapsed
@@ -559,25 +568,9 @@ class CollapsibleColumn(pg.QtWidgets.QWidget):
         return self.btn.sizeHint().height() + 4
 
     def _splitter_assign(self, want):
-        """Give this pane `want` px in its parent splitter, handing the
-        difference to the widest sibling so the list still sums to the
-        splitter's width: a lopsided request makes QSplitter
-        redistribute the surplus per size hints, which is how panes
-        used to spring back open."""
-        sp = self.parentWidget()
-        if not isinstance(sp, pg.QtWidgets.QSplitter):
-            return
-        idx = sp.indexOf(self)
-        sizes = sp.sizes()
-        delta = int(want) - sizes[idx]
-        if not delta:
-            return
-        sizes[idx] += delta
-        k = max((j for j in range(len(sizes)) if j != idx),
-                key=lambda j: sizes[j], default=None)
-        if k is not None:
-            sizes[k] -= delta
-        sp.setSizes([int(s) for s in sizes])
+        """Delegate: kept as a method -- _restore_layout and the fold
+        bookkeeping call amp_col._splitter_assign(...)."""
+        _splitter_assign(self, want)
 
     def set_collapsed(self, collapsed):
         collapsed = bool(collapsed)
@@ -5260,6 +5253,10 @@ if os.path.isfile(demo):
     load(demo)
 
 
+_FOLD_SECTIONS = (('tree', sec_tree), ('nano', sec_nano), ('info', sec_info),
+                  ('dist', sec_dist), ('files', exp_col))
+
+
 def _restore_layout():
     """Restore saved splitter sizes and folded sections. First launch (no
     saved state) uses a compact File info section: path + metadata visible
@@ -5298,8 +5295,7 @@ def _restore_layout():
     # amp column starts FOLDED on first launch (default True); the other
     # sections default to expanded. dist/tab died with the tab widget.
     settings.remove('dist/tab')
-    for key, sec in (('tree', sec_tree), ('nano', sec_nano), ('info', sec_info),
-                     ('dist', sec_dist), ('files', exp_col)):
+    for key, sec in _FOLD_SECTIONS:
         sec.set_collapsed(settings.value('layout/collapsed/' + key, False, type=bool))
     # left-column sections: seed the unfold height for still-folded ones.
     # The collapse transition above snapshots the live pane size -- which
@@ -5386,8 +5382,7 @@ def _save_layout():
     settings.setValue('grab/head', grab_head.value())
     settings.setValue('grab/smooth', grab_smooth.value())
     settings.setValue('grab/duty', grab_duty.value())
-    for key, sec in (('tree', sec_tree), ('nano', sec_nano), ('info', sec_info),
-                     ('dist', sec_dist), ('files', exp_col)):
+    for key, sec in _FOLD_SECTIONS:
         settings.setValue('layout/collapsed/' + key, sec.is_collapsed())
     settings.setValue('layout/collapsed/amp', amp_col.is_collapsed())
     settings.setValue('amp/bins_auto', amp_auto_bins.isChecked())
