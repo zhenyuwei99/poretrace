@@ -715,15 +715,15 @@ legend = plot.addLegend(brush=pg.mkBrush(255, 255, 255, 200),
 # top, collapsible Event panel below (see the analysis sections further
 # down); the splitters keep a fixed panel height while the traces take
 # the rest. top_split is horizontal: [main plot | amp column].
-dist_split = pg.QtWidgets.QSplitter(pg.QtCore.Qt.Vertical)
+right_split = pg.QtWidgets.QSplitter(pg.QtCore.Qt.Vertical)
 top_split = pg.QtWidgets.QSplitter(pg.QtCore.Qt.Horizontal)
 top_split.addWidget(plot)
-dist_split.addWidget(top_split)
+right_split.addWidget(top_split)
 right_col = pg.QtWidgets.QWidget()
 right_lay = pg.QtWidgets.QGridLayout()
 right_lay.setContentsMargins(0, 0, 0, 0)
 right_col.setLayout(right_lay)
-right_lay.addWidget(dist_split, 0, 0)
+right_lay.addWidget(right_split, 0, 0)
 hsplit.addWidget(right_col)
 
 # Resize and show window
@@ -921,7 +921,7 @@ drag_items = []
 drag_txt = ''
 
 
-def update_title_from_state(cursor_text=None):
+def update_readout(cursor_text=None):
     """Floating readout inside the plot: cursor line, A line, B line, delta
     line, free-drag line."""
     if not measure_btn.isChecked():
@@ -958,7 +958,7 @@ def clear_meas():
     meas_items.clear()
     meas_points = []
     drag_measure_hide()
-    update_title_from_state()
+    update_readout()
 
 
 def measure_toggled(checked):
@@ -968,7 +968,7 @@ def measure_toggled(checked):
     # analysis tabs own Shift+drag -- they can be on at the same time
     if not checked:
         drag_measure_hide()
-    update_title_from_state()
+    update_readout()
     if checked and last_mouse is not None:
         mouse_moved([last_mouse])
 
@@ -999,7 +999,7 @@ def plot_clicked(ev):
     meas_points.append((px, py, name, item))
     add_marker(px, py, 'A' if len(meas_points) == 1 else 'B')
     autofill_measurement(py)
-    update_title_from_state()
+    update_readout()
 
 
 def mouse_moved(evt):
@@ -1022,7 +1022,7 @@ def mouse_moved(evt):
         name = segment_at(vpos.x()) or (best[3].name() or '')
     txt = 'cursor: ' + format_point(vpos.x(), vpos.y(), name)
     last_cursor_text = txt
-    update_title_from_state(txt)
+    update_readout(txt)
 
 
 # --- Free drag measurement: left-drag inside the plot while Measure is on
@@ -1331,10 +1331,10 @@ def vb_drag_event(ev, axis=None):
                 drag_measure_hide()          # a click, not a drag: discard
             else:
                 drag_measure_show(p0, p1)
-            update_title_from_state()
+            update_readout()
         else:
             drag_measure_show(p0, p1)
-            update_title_from_state()
+            update_readout()
         return
     if (axis is None and ev.button() == pg.QtCore.Qt.LeftButton
             and _amp_active()
@@ -1451,7 +1451,7 @@ def load(file_name):
     # Clear the tree and update to show the structure provided in the embedded
     # .pul file
     tree.clear()
-    update_tree(tree.invisibleRootItem(), [])
+    rebuild_tree(tree.invisibleRootItem(), [])
     replot()
 
 
@@ -1513,7 +1513,7 @@ def _reload_file(silent=False):
         return False
     tree.blockSignals(True)
     tree.clear()
-    update_tree(tree.invisibleRootItem(), [])
+    rebuild_tree(tree.invisibleRootItem(), [])
     for path in sel_paths:
         item = _tree_item_by_path(path)
         if item is not None:
@@ -1564,7 +1564,7 @@ _sc_f5 = QShortcut(pg.QtGui.QKeySequence('F5'), win)
 _sc_f5.activated.connect(lambda: _reload_file())
     
 
-def update_tree(root_item, index):
+def rebuild_tree(root_item, index):
     """Recursively read tree information from the bundle's embedded .pul file
     and add items into the GUI tree to allow browsing.
 
@@ -1593,7 +1593,7 @@ def update_tree(root_item, index):
     if len(index) < 2:
         item.setExpanded(True)
     for i in range(len(node.children)):
-        update_tree(item, index + [i])
+        rebuild_tree(item, index + [i])
 
 
 def collect_traces(index, node, traces):
@@ -1908,7 +1908,7 @@ def total_points():
     return sum(len(y) for _, y, _, _ in last_data)
 
 
-def _tmin_decimation(t_min_ms, smooth_ms):
+def _tmin_points(t_min_ms, smooth_ms):
     """最短 (ms) -> 检测序列点数；平滑压缩后检测序列变稀，再除以窗宽。
     Used by the Grab tab's scoped detection."""
     dt0 = float(last_data[0][3].XInterval) if last_data else 0.0
@@ -1985,8 +1985,8 @@ def clear_amp_regions():
 #   lives in its own sideways-collapsible column right of the main plot,
 #   the Event panel (formerly Grab) occupies the bottom slot directly.
 
-sec_dist = Collapsible(T('sec.dist'))
-dist_split.addWidget(sec_dist)
+sec_events = Collapsible(T('sec.dist'))
+right_split.addWidget(sec_events)
 
 # Amplitude column: the histogram is ROTATED -- Y = the current axis,
 # X = % of samples -- and Y-linked to the main plot so a histogram peak
@@ -1995,8 +1995,8 @@ dist_split.addWidget(sec_dist)
 # label), which is what makes the link line up with the main plot's
 # native-unit view.
 amp_col = CollapsibleColumn(T('amp.title'))
-amp_tab = pg.QtWidgets.QWidget()
-amp_lay = pg.QtWidgets.QVBoxLayout(amp_tab)
+amp_body = pg.QtWidgets.QWidget()
+amp_lay = pg.QtWidgets.QVBoxLayout(amp_body)
 amp_lay.setContentsMargins(4, 4, 4, 4)
 amp_lay.setSpacing(3)
 # activation hint at the TOP, mirroring the Event panel's hint row; the
@@ -2056,7 +2056,7 @@ amp_lay.addWidget(amp_ruler_lbl)
 amp_stats = pg.QtWidgets.QLabel('')
 amp_stats.setWordWrap(True)
 amp_lay.addWidget(amp_stats)
-amp_col.body_lay.addWidget(amp_tab, 1)
+amp_col.body_lay.addWidget(amp_body, 1)
 top_split.addWidget(amp_col)
 # stretch: the main plot absorbs all resizing, the amp column keeps
 # whatever width it was given (setSizes / drag / restore). Without this,
@@ -2133,18 +2133,18 @@ def amp_ruler_toggled(checked):
 # detection runs inside it and the result is snapshotted into the record
 # list (right half). Detection parameters are this panel's own (snapshot at
 # grab/edit time; records keep the params they were made with).
-grab_tab = pg.QtWidgets.QWidget()
-grab_lay = pg.QtWidgets.QVBoxLayout(grab_tab)
+event_body = pg.QtWidgets.QWidget()
+grab_lay = pg.QtWidgets.QVBoxLayout(event_body)
 grab_lay.setContentsMargins(4, 4, 4, 4)
 grab_lay.setSpacing(2)
 
-grab_ctrl0 = pg.QtWidgets.QHBoxLayout()
+grab_hint_row = pg.QtWidgets.QHBoxLayout()
 grab_hint = pg.QtWidgets.QLabel(T('grab.hint'))
 grab_hint.setStyleSheet('color:#999;')
 grab_hint.setToolTip(T('grab.tip.hint'))
-grab_ctrl0.addWidget(grab_hint)
-grab_ctrl0.addStretch(1)
-grab_lay.addLayout(grab_ctrl0)
+grab_hint_row.addWidget(grab_hint)
+grab_hint_row.addStretch(1)
+grab_lay.addLayout(grab_hint_row)
 
 grab_ctrl = pg.QtWidgets.QHBoxLayout()           # this tab's own edge rules
 grab_mode = pg.QtWidgets.QComboBox()
@@ -2184,8 +2184,8 @@ grab_left_lay.setContentsMargins(0, 0, 0, 0)
 grab_left_lay.setSpacing(2)
 grab_plot = pg.PlotWidget()
 grab_left_lay.addWidget(grab_plot, 1)
-grab_stats = pg.QtWidgets.QLabel('')
-grab_left_lay.addWidget(grab_stats)
+grab_detail_lbl = pg.QtWidgets.QLabel('')
+grab_left_lay.addWidget(grab_detail_lbl)
 grab_split.addWidget(grab_left)
 
 grab_right = pg.QtWidgets.QWidget()
@@ -2249,9 +2249,9 @@ _grab_hdr.setSectionsClickable(True)
 grab_tree.setColumnWidth(0, 40)
 grab_tree.setColumnWidth(5, 26)
 grab_right_lay.addWidget(grab_tree, 1)
-grab_summary = pg.QtWidgets.QLabel('')   # running stats over ALL rows
-grab_summary.setStyleSheet('color:#666;')
-grab_right_lay.addWidget(grab_summary)
+grab_stats_lbl = pg.QtWidgets.QLabel('')   # running stats over ALL rows
+grab_stats_lbl.setStyleSheet('color:#666;')
+grab_right_lay.addWidget(grab_stats_lbl)
 grab_btns = pg.QtWidgets.QHBoxLayout()
 grab_viewall_btn = pg.QtWidgets.QPushButton(T('grab.viewall'))
 grab_viewall_btn.setCheckable(True)
@@ -2512,13 +2512,13 @@ doc_pages = pg.QtWidgets.QStackedWidget()
 
 empty_page = pg.QtWidgets.QWidget()
 empty_lay = pg.QtWidgets.QVBoxLayout(empty_page)
-new_doc_btn = pg.QtWidgets.QPushButton(T('doc.new'))
-new_doc_btn.setMinimumHeight(56)
+empty_new_btn = pg.QtWidgets.QPushButton(T('doc.new'))
+empty_new_btn.setMinimumHeight(56)
 empty_hint = pg.QtWidgets.QLabel(T('doc.empty.hint'))
 empty_hint.setStyleSheet('color:#999;')
 empty_hint.setAlignment(pg.QtCore.Qt.AlignCenter)
 empty_lay.addStretch(1)
-empty_lay.addWidget(new_doc_btn, 0, pg.QtCore.Qt.AlignCenter)
+empty_lay.addWidget(empty_new_btn, 0, pg.QtCore.Qt.AlignCenter)
 empty_lay.addSpacing(10)
 empty_lay.addWidget(empty_hint, 0, pg.QtCore.Qt.AlignCenter)
 empty_lay.addStretch(1)
@@ -2541,7 +2541,7 @@ doc_bar.addWidget(doc_new_btn)
 doc_bar.addWidget(doc_save_btn)
 doc_bar.addWidget(doc_saveas_btn)
 doc_lay.addLayout(doc_bar)
-doc_lay.addWidget(grab_tab, 1)
+doc_lay.addWidget(event_body, 1)
 doc_pages.addWidget(doc_page)
 
 doc_split = pg.QtWidgets.QSplitter(pg.QtCore.Qt.Horizontal)
@@ -2550,7 +2550,7 @@ doc_split.addWidget(exp_col)
 doc_split.setStretchFactor(0, 1)
 doc_split.setStretchFactor(1, 0)
 doc_pages.setCurrentIndex(0)          # app starts with no document open
-sec_dist.add_widget(doc_split)
+sec_events.add_widget(doc_split)
 
 # Visible, grabbable splitter handles everywhere: the Fusion default is a
 # few same-colour pixels that nobody can find or drag. A quiet grey bar
@@ -2563,7 +2563,7 @@ _SPLITTER_QSS = (
     'QSplitter::handle:hover { background: %s; }'
     'QSplitter::handle:pressed { background: %s; }'
     % (_SPLIT_ACCENT, _SPLIT_ACCENT))
-for _sp in (hsplit, vsplit, top_split, dist_split, doc_split, grab_split):
+for _sp in (hsplit, vsplit, top_split, right_split, doc_split, grab_split):
     _sp.setHandleWidth(9)
     _sp.setStyleSheet(_SPLITTER_QSS)
 
@@ -2845,7 +2845,7 @@ def _write_grab_csv(path):
                 # rows carry their own
                 sz, mt, fp = (
                     (grp.get('file_size', ''), grp.get('file_mtime', ''),
-                     grp.get('file_fp') or '')
+                     grp.get('file_hash') or '')
                     if grp is not None
                     else (rec.get('file_size', ''),
                           rec.get('file_mtime', ''),
@@ -3064,7 +3064,7 @@ def _refresh_mode_hints():
     grab_hint.setText(T('grab.hint') if evt_on else T('grab.hint.off'))
     grab_hint.setStyleSheet(_HINT_ON if evt_on else _HINT_OFF)
     _mode_header(amp_col.btn, amp_on)
-    _mode_header(sec_dist.btn, evt_on)
+    _mode_header(sec_events.btn, evt_on)
 
 
 def _set_ui_mode(mode):
@@ -3221,7 +3221,7 @@ _GRAB_DETAIL_YSPAN = 2.0    # detail-view uniform Y width = this x mean
 
 def _grab_active():
     """Event mode armed: event panel clicked last, panel expanded."""
-    return _ui_mode[0] == 'event' and not sec_dist.is_collapsed()
+    return _ui_mode[0] == 'event' and not sec_events.is_collapsed()
 
 
 def _grab_source_key():
@@ -3238,7 +3238,7 @@ def _grab_grp_matches(grp):
     key = _grab_source_key()
     if grp['source_key'] == key:
         return True
-    fp = grp.get('file_fp')
+    fp = grp.get('file_hash')
     return (bool(fp) and bool(_loaded_fp) and fp == _loaded_fp
             and grp['source_key'][1:] == key[1:])
 
@@ -3338,7 +3338,7 @@ def _grab_new_group(x0, x1, y0, y1):
     return dict(id=gid, color=THEME['cycle'][gid % len(THEME['cycle'])],
                 x0=x0, x1=x1, y0=y0, y1=y1,
                 source_key=_grab_source_key(), params=_grab_params(),
-                file_fp=_loaded_fp, file_size=sz, file_mtime=mt,
+                file_hash=_loaded_fp, file_size=sz, file_mtime=mt,
                 events=np.empty(0, analysis.EVENT_DTYPE),
                 stats=None, error=None, ev_refs=[])
 
@@ -3481,8 +3481,8 @@ def grab_drag_finish(x0, x1, y0, y1):
     n = len(grp['events'])
     if n > _GRAB_MAX_EVENTS:
         _grab_drop_group(grp['id'])
-        grab_stats.setToolTip('')
-        grab_stats.setText(
+        grab_detail_lbl.setToolTip('')
+        grab_detail_lbl.setText(
             T('amp.over.commit', c=THEME['A'], n=n, cap=_GRAB_MAX_EVENTS))
         _grab_show_overlays()
         return
@@ -3528,7 +3528,7 @@ def _grab_detect(grp, full=True):
     try:
         res = analysis.detect_events_segments(
             segs, mode=p['mode'], lo=grp['y0'], hi=grp['y1'], h=None,
-            k=p['k'], t_min=_tmin_decimation(p['t_min_ms'], p['smooth_ms']),
+            k=p['k'], t_min=_tmin_points(p['t_min_ms'], p['smooth_ms']),
             merge_gap=p['merge'], duty_min=p['duty'])
     except ValueError as exc:
         grp['error'] = str(exc)
@@ -3766,8 +3766,8 @@ def _grab_roi_commit(grp):
     _grab_detect(grp)
     n = len(grp['events'])
     if n > _GRAB_MAX_EVENTS:
-        grab_stats.setToolTip('')
-        grab_stats.setText(
+        grab_detail_lbl.setToolTip('')
+        grab_detail_lbl.setText(
             T('amp.over.edit', c=THEME['A'], n=n, cap=_GRAB_MAX_EVENTS))
         return
     _grab_sync_group(grp)
@@ -3956,9 +3956,9 @@ def _grab_stats_text(rec):
     line, no wrapping -- vertical space is precious in the panel)."""
     grp = _grab_groups.get(rec['gid']) if rec['gid'] is not None else None
     if grp is None:
-        grab_stats.setToolTip('')
+        grab_detail_lbl.setToolTip('')
         return _grab_stats_head(rec)
-    grab_stats.setToolTip(_grab_stats_tip(grp))
+    grab_detail_lbl.setToolTip(_grab_stats_tip(grp))
     head = _grab_stats_head(rec, group=True)
     st = grp.get('stats') if grp else None
     if grp is not None and grp['error']:
@@ -3978,7 +3978,7 @@ def _grab_group_stats_text(grp, preview=False):
     """Stats for a row-less group: guidance while the user tunes the
     rectangle (0 events / detection error / live-drag preview) -- including
     the segment noise, so the user can judge the stretch before tuning."""
-    grab_stats.setToolTip(_grab_stats_tip(grp))
+    grab_detail_lbl.setToolTip(_grab_stats_tip(grp))
     rank = _grab_group_ranks().get(grp['id'], '?')
     noise = np.mean(_grab_segment_noise(grp, _grab_raw_segs_for(grp))) \
         if not grp['error'] else 0.0
@@ -4083,7 +4083,7 @@ def _grab_show_imported(rec):
     select to bring it alive."""
     pi = grab_plot.getPlotItem()
     pi.clear()
-    grab_stats.setToolTip('')
+    grab_detail_lbl.setToolTip('')
     k = _grab_ref_display_pos(rec)
     if k is None:
         if not _grab_row_file_ok(rec):
@@ -4098,7 +4098,7 @@ def _grab_show_imported(rec):
                             else T('grab.w.off')))
             else:
                 hint = T('grab.imp.select', label=trace_label(idx))
-        grab_stats.setText(
+        grab_detail_lbl.setText(
             _grab_stats_head(rec)
             + '<br>' + T('grab.notlive', hint=hint))
         return
@@ -4126,7 +4126,7 @@ def _grab_show_imported(rec):
                                    connect='finite'))
     if c is not None:
         _grab_add_event_curve(pi, c[0], c[1], 3)
-    grab_stats.setText(_grab_stats_head(rec))
+    grab_detail_lbl.setText(_grab_stats_head(rec))
     pi.setXRange(x0, x1, padding=0.02)
     ext = _grab_region_extent(x0, x1)
     if wy is not None and ext is not None:
@@ -4168,14 +4168,14 @@ def _grab_show_selected():
         else _grab_groups.get(rec['gid'])
     if rec is None and grp is None:
         if grab_records:
-            grab_stats.setToolTip('')
-            grab_stats.setText(T('grab.allgrey', n=len(grab_records)))
+            grab_detail_lbl.setToolTip('')
+            grab_detail_lbl.setText(T('grab.allgrey', n=len(grab_records)))
         else:
-            grab_stats.setToolTip('')
-            grab_stats.setText(T('grab.norec'))
+            grab_detail_lbl.setToolTip('')
+            grab_detail_lbl.setText(T('grab.norec'))
         return
     if not _grab_grp_matches(grp):
-        grab_stats.setText(
+        grab_detail_lbl.setText(
             T('grab.otherdata.rec', r=_grab_rank_of(rec),
               g=_grab_group_ranks().get(rec['gid'], 0),
               stats=_grab_stats_text(rec))
@@ -4187,11 +4187,11 @@ def _grab_show_selected():
     wy = None
     ext = None
     if rec is None:
-        grab_stats.setText(_grab_group_stats_text(grp, preview))
+        grab_detail_lbl.setText(_grab_group_stats_text(grp, preview))
         x0, x1 = grp['x0'], grp['x1']
         bright = None
     else:
-        grab_stats.setText(_grab_stats_text(rec))
+        grab_detail_lbl.setText(_grab_stats_text(rec))
         wx, wy = _grab_detail_windows()
         xc = 0.5 * (rec['t_start'] + rec['t_end'])
         x0, x1 = xc - 0.5 * wx, xc + 0.5 * wx
@@ -4447,12 +4447,12 @@ def _grab_update_summary():
     other data included -- the list is the curated dataset). TWO fixed
     lines: means, then medians."""
     if not grab_records:
-        grab_summary.setText('')
+        grab_stats_lbl.setText('')
         return
     dw = np.array([r['dwell'] for r in grab_records])
     lv = np.array([r['y_level'] for r in grab_records])
     sg = np.array([r['sigma'] for r in grab_records])
-    grab_summary.setText(
+    grab_stats_lbl.setText(
         T('grab.summary', n=len(grab_records),
           dm=fmt_si(float(dw.mean()), 's'),
           lm=fmt_si(float(lv.mean()), cur_yunit),
@@ -4987,7 +4987,7 @@ def _doc_restore_context():
         if not src_file and grp['source_key'][0]:
             src_file = grp['source_key'][0]
         if src_hash is None:
-            src_hash = grp.get('file_fp') or None
+            src_hash = grp.get('file_hash') or None
         joins.add(bool(grp['source_key'][1]))
     for r in grab_records:
         if r['gid'] is not None:
@@ -5162,7 +5162,7 @@ class _ModeClickFilter(pg.QtCore.QObject):
                 if w is amp_col:
                     _set_ui_mode('amp')
                     break
-                if w is sec_dist:
+                if w is sec_events:
                     _set_ui_mode('event')
                     break
                 w = w.parentWidget()
@@ -5178,7 +5178,7 @@ grab_tree.header().sectionClicked.connect(_grab_header_clicked)
 grab_viewall_btn.toggled.connect(lambda *_: _grab_show_overlays())
 grab_clear_btn.clicked.connect(_grab_clear)
 grab_recalc_btn.clicked.connect(_grab_recalc_all)
-new_doc_btn.clicked.connect(lambda *_: _doc_new())
+empty_new_btn.clicked.connect(lambda *_: _doc_new())
 doc_new_btn.clicked.connect(lambda *_: _doc_new())
 doc_tabs.tabCloseRequested.connect(lambda i: _doc_close_tab(i))
 doc_tabs.currentChanged.connect(lambda i: _doc_switch(i))
@@ -5226,7 +5226,7 @@ amp_clear_btn.clicked.connect(
 vb.sigYRangeChanged.connect(_amp_follow_main_y)
 vb.sigRangeChanged.connect(_main_range_changed)
 clear_btn.clicked.connect(clear_analysis)
-sec_dist.btn.clicked.connect(_event_panel_toggled)
+sec_events.btn.clicked.connect(_event_panel_toggled)
 amp_col.btn.clicked.connect(_amp_col_toggled)
 
 
@@ -5254,7 +5254,7 @@ if os.path.isfile(demo):
 
 
 _FOLD_SECTIONS = (('tree', sec_tree), ('nano', sec_nano), ('info', sec_info),
-                  ('dist', sec_dist), ('files', exp_col))
+                  ('dist', sec_events), ('files', exp_col))
 
 
 def _restore_layout():
@@ -5272,9 +5272,9 @@ def _restore_layout():
         vsplit.setSizes((150, 380, 200))
     ds = settings.value('layout/distsplit')
     if ds:
-        dist_split.setSizes([int(s) for s in ds])
+        right_split.setSizes([int(s) for s in ds])
     else:
-        dist_split.setSizes((600, 220))
+        right_split.setSizes((600, 220))
     gs = settings.value('layout/grabsplit')
     # legacy saves hold THREE sizes (zoom | tree | files, before the file
     # column moved to its own document splitter): the inner splitter keeps
@@ -5364,7 +5364,7 @@ def _save_layout():
             settings.setValue(k_open, int(sec._restore))
         else:
             settings.remove(k_open)
-    settings.setValue('layout/distsplit', list(dist_split.sizes()))
+    settings.setValue('layout/distsplit', list(right_split.sizes()))
     # save the UNFOLDED amp width: quitting while collapsed stores the
     # strip width, which would become the unfold-restore width otherwise
     if amp_col.is_collapsed() and getattr(amp_col, '_restore', 0):
