@@ -1623,6 +1623,7 @@ def build_joined(entries):
     (x, y, seams, segments): seams holds the junction times between
     consecutive segments (len(entries) - 1 entries); segments holds
     (x_start, x_end, label) per segment for the measure cursor lookup.
+    The joined axis advancement must match _join_t_starts (detection side).
     """
     xs = []
     ys = []
@@ -1820,6 +1821,18 @@ def _tint(hexcolor, alpha):
     return pg.mkBrush(c)
 
 
+def _join_t_starts(prepped):
+    """Running start time of each prepped trace on the joined axis.
+
+    Advances by the FULL sweep length (head slicing must not compress
+    the time axis); must stay aligned with build_joined's display axis."""
+    t, starts = float(prepped[0][3].XStart), []
+    for _x, _y, _l, trace, n_full in prepped:
+        starts.append(t)
+        t += n_full * float(trace.XInterval)
+    return starts
+
+
 def analysis_segments(stride=1, head_s=0.0, smooth_ms=0.0):
     """(t, y) segments for heka.analysis.
 
@@ -1842,17 +1855,11 @@ def analysis_segments(stride=1, head_s=0.0, smooth_ms=0.0):
     if _join_active and prepped:
         if (_join_cache is None
                 or _join_cache[:3] != (_data_stamp, head_s, smooth_ms)):
-            xs, ys, t = [], [], None
-            for x, y, label, trace, n_full in prepped:
-                # place each sweep on the same timeline as the displayed
-                # join: advance by the FULL sweep duration (head slicing
-                # only hides samples, it must not compress the axis)
-                if t is None:
-                    t = float(trace.XStart)
-                dt = float(trace.XInterval)
-                xs.append(t + (x - float(trace.XStart)))
+            starts = _join_t_starts(prepped)
+            xs, ys = [], []
+            for (x, y, _label, trace, _n), start in zip(prepped, starts):
+                xs.append(start + (x - float(trace.XStart)))
                 ys.append(y)
-                t += n_full * dt
             _join_cache = (_data_stamp, head_s, smooth_ms,
                              (np.concatenate(xs), np.concatenate(ys)))
         x, y = _join_cache[3]
@@ -3570,12 +3577,7 @@ def _grab_ev_refs(grp):
     if not prepped or len(prepped) > len(last_data_idx):
         return refs
     if _join_active:
-        seams = []
-        t = float(prepped[0][3].XStart)
-        for _x, _y, _label, trace, n_full in prepped:
-            t += n_full * float(trace.XInterval)
-            seams.append(t)
-        seams = seams[:-1]
+        seams = _join_t_starts(prepped)[1:]
         for j, t0 in enumerate(evs['t_start']):
             k = int(np.searchsorted(seams, float(t0), side='left'))
             if 0 <= k < len(prepped):
