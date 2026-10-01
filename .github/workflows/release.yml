@@ -26,10 +26,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: macos-latest,   asset: HekaBrowser-mac-arm64.zip }
-          - { os: macos-13,       asset: HekaBrowser-mac-intel.zip }
-          - { os: windows-latest, asset: HekaBrowser-windows.zip }
-          - { os: ubuntu-22.04,   asset: HekaBrowser-linux.zip }
+          - { os: macos-latest,   asset: poretrace-mac-arm64.zip }
+          - { os: macos-13,       asset: poretrace-mac-intel.zip }
+          - { os: windows-latest, asset: poretrace-windows.zip }
+          - { os: ubuntu-22.04,   asset: poretrace-linux.zip }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -51,15 +51,15 @@ jobs:
 
       - name: Package zip (macOS)
         if: runner.os == 'macOS'
-        run: ditto -c -k --keepParent dist/HekaBrowser.app "dist/${{ matrix.asset }}"
+        run: ditto -c -k --keepParent dist/poretrace.app "dist/${{ matrix.asset }}"
 
       - name: Package zip (Windows)
         if: runner.os == 'Windows'
-        run: powershell -NoProfile -Command "Compress-Archive -Path 'dist\HekaBrowser\*' -DestinationPath 'dist\${{ matrix.asset }}' -Force"
+        run: powershell -NoProfile -Command "Compress-Archive -Path 'dist\poretrace\*' -DestinationPath 'dist\${{ matrix.asset }}' -Force"
 
       - name: Package zip (Linux)
         if: runner.os == 'Linux'
-        run: cd dist && zip -qry "${{ matrix.asset }}" HekaBrowser
+        run: cd dist && zip -qry "${{ matrix.asset }}" poretrace
 
       - uses: actions/upload-artifact@v4
         with:
@@ -82,13 +82,13 @@ jobs:
           files: assets/*.zip
           generate_release_notes: true
           body: |
-            **macOS**: unzip, then right-click ``HekaBrowser.app`` -> *Open*
+            **macOS**: unzip, then right-click ``poretrace.app`` -> *Open*
             (unsigned app). If macOS reports it as "damaged", run:
-            ``xattr -cr /Applications/HekaBrowser.app``
-            安装：解压后右键 ``HekaBrowser.app`` -> *打开*（未签名应用）；
-            若提示"已损坏"，终端执行 ``xattr -cr /Applications/HekaBrowser.app``
+            ``xattr -cr /Applications/poretrace.app``
+            安装：解压后右键 ``poretrace.app`` -> *打开*（未签名应用）；
+            若提示"已损坏"，终端执行 ``xattr -cr /Applications/poretrace.app``
 
             **Windows**: SmartScreen may warn -> *"More info"* -> *"Run anyway"*.
             智能屏幕警告属正常 -> *"更多信息"* -> *"仍要运行"*。
 
-            **Linux**: unzip, then ``chmod +x HekaBrowser/HekaBrowser && ./HekaBrowser/HekaBrowser``
+            **Linux**: unzip, then ``chmod +x poretrace/poretrace && ./poretrace/poretrace``

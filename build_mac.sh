@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build dist/HekaBrowser.app on macOS.
+# Build dist/poretrace.app on macOS.
 #
 # Uses a dedicated conda env with pip-installed PyQt5 (NOT the experiment
 # env -- conda's Qt layout is a known PyInstaller minefield). Python 3.12
@@ -29,10 +29,10 @@ python -m PyInstaller heka_browser.spec --noconfirm --clean
 
 # 4) zip for distribution (ditto preserves the .app bundle structure)
 cd dist
-ditto -c -k --keepParent HekaBrowser.app HekaBrowser-mac.zip
+ditto -c -k --keepParent poretrace.app poretrace-mac.zip
 cd ..
 
 echo
-echo "Done: dist/HekaBrowser.app  (+ dist/HekaBrowser-mac.zip)"
-echo "Daily use: copy HekaBrowser.app to /Applications (leaves cloud-synced folders)."
+echo "Done: dist/poretrace.app  (+ dist/poretrace-mac.zip)"
+echo "Daily use: copy poretrace.app to /Applications (leaves cloud-synced folders)."
 echo "First launch on another Mac: right-click -> Open (unsigned app)."

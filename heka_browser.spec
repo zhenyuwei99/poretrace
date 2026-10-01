@@ -1,12 +1,12 @@
 # -*- mode: python ; coding: utf-8 -*-
-# PyInstaller spec for the Heka .dat browser -- onedir on all platforms.
+# PyInstaller spec for the Heka .dat browser -- onedir on all platforms.  Artifacts are named poretrace.
 #
 # onedir (instead of onefile) removes the per-launch temp-extraction step,
 # making startup ~3-8x faster and consistent between cold and warm launches.
 # Each build script zips the output folder for distribution:
-#   macOS:    dist/HekaBrowser.app  (+ HekaBrowser-mac.zip)
-#   Windows:  dist/HekaBrowser/HekaBrowser.exe  (+ HekaBrowser-windows.zip)
-#   Linux:    dist/HekaBrowser/HekaBrowser      (+ HekaBrowser-linux.zip)
+#   macOS:    dist/poretrace.app  (+ poretrace-mac.zip)
+#   Windows:  dist/poretrace/poretrace.exe  (+ poretrace-windows.zip)
+#   Linux:    dist/poretrace/poretrace  (+ poretrace-linux.zip)
 # Build with:  python -m PyInstaller heka_browser.spec --noconfirm --clean
 
 import platform
@@ -34,7 +34,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,               # binaries/datas collected below
-    name='HekaBrowser',
+    name='poretrace',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -55,19 +55,19 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name='HekaBrowser',
+    name='poretrace',
 )
 
 if platform.system() == 'Darwin':
     # Wrap the collected folder in a double-clickable .app bundle
     app = BUNDLE(
         coll,
-        name='HekaBrowser.app',
+        name='poretrace.app',
         icon=None,
-        bundle_identifier='org.lab.hekabrowser',
+        bundle_identifier='io.github.zhenyuwei99.poretrace',
         info_plist={
-            'CFBundleName': 'HekaBrowser',
-            'CFBundleDisplayName': 'Heka Browser',
+            'CFBundleName': 'poretrace',
+            'CFBundleDisplayName': 'PoreTrace',
             'NSHighResolutionCapable': True,
         },
     )

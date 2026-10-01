@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build dist/HekaBrowser on Linux (single file, chmod +x to run).
+# Build dist/poretrace on Linux (single file, chmod +x to run).
 #
 # IMPORTANT: build on the OLDEST distro you want to support (e.g. Ubuntu
 # 22.04) -- the resulting binary requires at most the glibc of the build
@@ -20,9 +20,9 @@ python -m PyInstaller heka_browser.spec --noconfirm --clean
 
 # zip for distribution
 cd dist
-zip -qry HekaBrowser-linux.zip HekaBrowser
+zip -qry poretrace-linux.zip poretrace
 cd ..
 
 echo
-echo "Done: dist/HekaBrowser/HekaBrowser  (+ dist/HekaBrowser-linux.zip)"
-echo "Unzip anywhere, then: chmod +x HekaBrowser && ./HekaBrowser"
+echo "Done: dist/poretrace/poretrace  (+ dist/poretrace-linux.zip)"
+echo "Unzip anywhere, then: chmod +x poretrace && ./poretrace"

@@ -2,9 +2,11 @@
 
 ## 运行与构建
 
-- 日常开发/运行：conda env `experiment`（`/Users/zhenyuwei/Program/anaconda3/envs/experiment/bin/python3`，Python 3.14 + PyQt5 + pyqtgraph 0.14）。在本目录 `python browser.py` 即可启动，改代码即时生效。
+- 日常开发/运行：conda env `experiment`（`/Users/zhenyuwei/Program/anaconda3/envs/experiment/bin/python3`，Python 3.14 + PyQt5 + pyqtgraph 0.14）。在本目录 `python heka/browser.py` 即可启动，改代码即时生效。
+- **包布局（2026-10 起）**：`heka/` 是真正的 Python 包（`from heka import analysis` 等），仓库根只有 `launcher.py`（PyInstaller 入口，`from heka import browser`）、`test_analysis.py`、构建脚本和 spec——**绝不允许 import 依赖检出目录名**（CI 检出目录叫 poretrace，曾因 `from heka import ...` + 目录名恰好是 heka 才本地能跑而 CI 全挂）。
 - **不要主动打包。只在用户明确要求时才运行 `bash build_mac.sh`**（Windows/Linux 对应 `build_windows.bat` / `build_linux.sh`）。
-- 打包用独立 conda env `hekabuild`（Python 3.12 + pip 版 PyQt5/PyInstaller，脚本自动创建）。**绝不能从 `experiment` env 打包**（conda Qt + PyInstaller 是雷区）。产物：`dist/HekaBrowser.app` + zip，onedir 模式（别改回 onefile）。
+- 打包用独立 conda env `hekabuild`（Python 3.12 + pip 版 PyQt5/PyInstaller，脚本自动创建）。**绝不能从 `experiment` env 打包**（conda Qt + PyInstaller 是雷区）。产物：`dist/poretrace.app` + zip（2026-10 起产物统一叫 poretrace），onedir 模式（别改回 onefile）。
+- **CI 自动发布（2026-10 起）**：`.github/workflows/release.yml`——push `v*` tag 触发 4 平台 matrix 构建（macos-latest=arm64 / macos-13=Intel·已列入退役 / windows-latest / ubuntu-22.04·glibc 兼容下限），`test_analysis.py` 作发布门禁，成功后 softprops 自动建 Release 挂 zip；`workflow_dispatch` 手动跑只出 artifact 不发布。产物名 `poretrace-{mac-arm64,mac-intel,windows,linux}.zip`。发版 = `git tag vX.Y.Z && git push origin vX.Y.Z`。
 - 本目录**是 git 仓库**（2026-09 初始化，baseline 在首次提交）；commit 用 `-c user.name/user.email` 显式指定身份。
 
 ## 架构要点

@@ -1,5 +1,5 @@
 @echo off
-rem Build dist\HekaBrowser.exe on Windows (single file, double-click to run).
+rem Build dist\poretrace.exe on Windows (single file, double-click to run).
 rem
 rem Prerequisite (once): Python 3.12 from https://www.python.org/downloads/
 rem ("Add python.exe to PATH" during install). The py launcher is used here.
@@ -17,11 +17,11 @@ python -m pip install pyqt5 pyqtgraph numpy pyinstaller
 python -m PyInstaller heka_browser.spec --noconfirm --clean
 
 rem zip for distribution
-powershell -NoProfile -Command "Compress-Archive -Path 'dist\HekaBrowser\*' -DestinationPath 'dist\HekaBrowser-windows.zip' -Force"
+powershell -NoProfile -Command "Compress-Archive -Path 'dist\poretrace\*' -DestinationPath 'dist\poretrace-windows.zip' -Force"
 
 echo.
-echo Done: dist\HekaBrowser\HekaBrowser.exe  (+ dist\HekaBrowser-windows.zip)
-echo Unzip anywhere and double-click HekaBrowser.exe.
+echo Done: dist\poretrace\poretrace.exe  (+ dist\poretrace-windows.zip)
+echo Unzip anywhere and double-click poretrace.exe.
 echo First launch: SmartScreen may warn -- "More info" ^> "Run anyway".
 pause
 exit /b 0

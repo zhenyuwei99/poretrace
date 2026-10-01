@@ -350,27 +350,27 @@ tr.RsValue, tr.CSlow, ...        # 放大器状态、密封质量等全套元数
 
 ## 6. 打包为可执行文件（PyInstaller）
 
-无需安装 Python、双击即用的独立程序（onedir 模式，含浅色主题）。**PyInstaller 不支持交叉编译**——每个平台的产物必须在对应系统上构建。
+无需安装 Python、双击即用的独立程序（onedir 模式，含浅色主题）。**最简单：直接从 [GitHub Releases](https://github.com/zhenyuwei99/poretrace/releases) 下载预编译包**（macOS arm64/Intel、Windows、Linux 全平台，打 tag 自动构建）。**PyInstaller 不支持交叉编译**——每个平台的产物必须在对应系统上构建。
 
 | 平台 | 构建命令（在对应系统上跑） | 产物（自动打 zip） |
 |---|---|---|
-| macOS | `bash build_mac.sh`（本机已验证：启动 ~0.1–1 s） | `dist/HekaBrowser.app` + `HekaBrowser-mac.zip`（~35 MB） |
-| Windows | 双击 `build_windows.bat`（需先装一次 [Python 3.12](https://www.python.org/downloads/)，勾选 Add to PATH） | `dist/HekaBrowser/` → `HekaBrowser-windows.zip` |
-| Linux | `bash build_linux.sh`（**在 Ubuntu 22.04 等最老目标系统上构建**，glibc 向后兼容） | `dist/HekaBrowser/` → `HekaBrowser-linux.zip` |
+| macOS | `bash build_mac.sh`（本机已验证：启动 ~0.1–1 s） | `dist/poretrace.app` + `poretrace-mac.zip`（~35 MB） |
+| Windows | 双击 `build_windows.bat`（需先装一次 [Python 3.12](https://www.python.org/downloads/)，勾选 Add to PATH） | `dist/poretrace/` → `poretrace-windows.zip` |
+| Linux | `bash build_linux.sh`（**在 Ubuntu 22.04 等最老目标系统上构建**，glibc 向后兼容） | `dist/poretrace/` → `poretrace-linux.zip` |
 
 脚本会自动创建独立构建环境（`hekabuild` conda env / `build-venv`，Python 3.12 + pip 版 PyQt5/PyInstaller），不影响日常实验环境。
 
-**为什么用 onedir 而不是单文件**：onefile 每次启动都要把 ~150 MB 解压到随机临时目录并重新链接全部 Qt 动态库（冷启动 2–8 s，且 macOS 弃用该模式）；onedir 文件就地存放，启动稳定在 **0.1–1 s**、冷热一致。分发时把产物打成 zip（脚本自动完成），接收方解压后双击里面的 `HekaBrowser.app` / `HekaBrowser.exe` / `HekaBrowser`。
+**为什么用 onedir 而不是单文件**：onefile 每次启动都要把 ~150 MB 解压到随机临时目录并重新链接全部 Qt 动态库（冷启动 2–8 s，且 macOS 弃用该模式）；onedir 文件就地存放，启动稳定在 **0.1–1 s**、冷热一致。分发时把产物打成 zip（脚本自动完成），接收方解压后双击里面的 `poretrace.app` / `poretrace.exe` / `poretrace`。
 
-**日常使用建议**：把 `HekaBrowser.app` 拷贝到 `/Applications`（或 `~/Applications`）使用——一是离开坚果云等同步文件夹（避免打开时等同步/下载），二是 Gatekeeper 对路径+签名缓存后不再重复扫描。
+**日常使用建议**：把 `poretrace.app` 拷贝到 `/Applications`（或 `~/Applications`）使用——一是离开坚果云等同步文件夹（避免打开时等同步/下载），二是 Gatekeeper 对路径+签名缓存后不再重复扫描。
 
 **接收方首次放行（未签名应用）**
 
 | 平台 | 提示 | 处理 |
 |---|---|---|
-| macOS | 「无法验证开发者」 | 右键 App → 打开；或终端 `xattr -cr /path/HekaBrowser.app` |
+| macOS | 「无法验证开发者」 | 右键 App → 打开；或终端 `xattr -cr /path/poretrace.app` |
 | Windows | SmartScreen 蓝色警告 | 「更多信息」→「仍要运行」 |
-| Linux | 无执行权限 | `chmod +x HekaBrowser`（解压后执行） |
+| Linux | 无执行权限 | `chmod +x poretrace`（解压后执行） |
 
 **排障**
 
@@ -378,7 +378,7 @@ tr.RsValue, tr.CSlow, ...        # 放大器状态、密封质量等全套元数
 |---|---|
 | Linux 报 `GLIBC_2.xx not found` | 构建机 glibc 太新——换更老的系统（如 Ubuntu 22.04 容器）重新构建 |
 | Windows 杀软报毒 | PyInstaller 打包常见误报，加白名单即可 |
-| 双击 mac App 一闪而过 | 先在终端跑 `dist/HekaBrowser.app/Contents/MacOS/HekaBrowser` 看报错 |
+| 双击 mac App 一闪而过 | 先在终端跑 `dist/poretrace.app/Contents/MacOS/poretrace` 看报错 |
 | Linux 双击无反应 | 确认 `chmod +x`；桌面环境不同双击行为各异，可终端运行 |
 
 ## 出处
