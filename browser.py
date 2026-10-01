@@ -2920,16 +2920,13 @@ def amp_values(r0, r1, stride):
 
     With Join on the regions live on the continuous joined axis, so the
     values come from the cached joined raw arrays; otherwise per trace.
-    """
-    if _join_active and _joined_display is not None:
-        x, y = _joined_display
-        v = y[(x >= r0) & (x <= r1)]
-        if stride > 1:
-            v = v[::stride]
-        return [v] if v.size else []
+    x is monotonic everywhere -> searchsorted slice (never a full-axis
+    boolean mask)."""
+    pairs = ([_joined_display] if (_join_active and _joined_display is not None)
+             else [(x, y) for x, y, _l, _t in last_data])
     vals = []
-    for x, y, label, trace in last_data:
-        v = y[(x >= r0) & (x <= r1)]
+    for x, y in pairs:
+        v = y[np.searchsorted(x, r0, 'left'):np.searchsorted(x, r1, 'right')]
         if stride > 1:
             v = v[::stride]
         if v.size:
@@ -3557,6 +3554,15 @@ def _grab_trace_ref(index, trace):
             int(trace.DataPoints), float(trace.XInterval), trace.YUnit)
 
 
+def _kept_seg_indices(grp, segs):
+    """Indices of segments holding >=1 sample inside grp bounds (the
+    display side MUST use the same keep-rule as detection: only
+    non-empty segments keep their i_seg slot)."""
+    return [k for k, (x, _y) in enumerate(segs)
+            if len(x) and np.searchsorted(x, grp['x1'], 'right')
+            > np.searchsorted(x, grp['x0'], 'left')]
+
+
 def _grab_ev_refs(grp):
     """Per-event source-trace refs aligned with grp['events'] (None when
     the mapping cannot be established). Must run while the group's source
@@ -3583,8 +3589,7 @@ def _grab_ev_refs(grp):
             if 0 <= k < len(prepped):
                 refs[j] = _grab_trace_ref(last_data_idx[k], prepped[k][3])
         return refs
-    kept = [k for k, (x, y, _label, _trace, _n) in enumerate(prepped)
-            if len(x) and ((x >= grp['x0']) & (x <= grp['x1'])).any()]
+    kept = _kept_seg_indices(grp, [(p[0], p[1]) for p in prepped])
     for j, seg_i in enumerate(evs['i_seg']):
         if 0 <= int(seg_i) < len(kept):
             k = kept[int(seg_i)]
@@ -3792,9 +3797,7 @@ def _grab_event_trace_pos(grp, i_seg):
     p = grp['params']
     segs = analysis_segments(1, head_s=p['head_ms'] * 1e-3,
                              smooth_ms=p['smooth_ms'])
-    kept = [k for k, (x, _y) in enumerate(segs)
-            if len(x) and np.searchsorted(x, grp['x1'], side='right')
-            > np.searchsorted(x, grp['x0'], side='left')]
+    kept = _kept_seg_indices(grp, segs)
     return kept[int(i_seg)] if 0 <= int(i_seg) < len(kept) else None
 
 
@@ -3806,9 +3809,7 @@ def _grab_group_span_curves(grp, spans=None):
     p = grp['params']
     segs = analysis_segments(1, head_s=p['head_ms'] * 1e-3,
                              smooth_ms=p['smooth_ms'])
-    kept = [k for k, (x, _y) in enumerate(segs)
-            if len(x) and np.searchsorted(x, grp['x1'], side='right')
-            > np.searchsorted(x, grp['x0'], side='left')]
+    kept = _kept_seg_indices(grp, segs)
     out = []
     for t0, t1, g in (_grab_group_spans(grp) if spans is None else spans):
         k = kept[int(g)] if 0 <= int(g) < len(kept) else None
