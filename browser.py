@@ -1109,6 +1109,10 @@ class NumericEdit(pg.QtWidgets.QLineEdit):
     def _fmt(v):
         return '%.6g' % v
 
+    @staticmethod
+    def _norm(text):
+        return text.replace('，', '.').replace('。', '.').replace('．', '.')
+
     def value(self):
         return self._valid
 
@@ -1123,14 +1127,14 @@ class NumericEdit(pg.QtWidgets.QLineEdit):
         self._on_editing_finished()
 
     def _parse(self):
-        text = (self.text().replace('，', '.').replace('。', '.').replace('．', '.'))
+        text = self._norm(self.text())
         try:
             return float(text)
         except ValueError:
             return None
 
     def _on_text_changed(self, text):
-        normalized = text.replace('，', '.').replace('。', '.').replace('．', '.')
+        normalized = self._norm(text)
         if normalized != text:
             self._normalizing = True
             self.setText(normalized)
@@ -2620,6 +2624,14 @@ def _doc_activate_tab(d):
     doc_pages.setCurrentIndex(1)
 
 
+def _doc_spawn(d):
+    """Append a document slot, make it active, open its tab."""
+    global _doc
+    _doc_list.append(d)
+    _doc = d
+    _doc_activate_tab(d)
+
+
 def _grab_detach_rects():
     """Take every rectangle off the main plot (they stay alive in their
     doc slot; add_grab_items re-attaches the matching ones after the
@@ -2676,8 +2688,7 @@ def _doc_state_restore():
         p.setdefault('smooth', p.get('smooth_ms'))
         _apply_doc_params(p)
     _refresh_grab_list()
-    _grab_show_selected()
-    _grab_show_overlays()
+    _grab_refresh_views()
 
 
 def _doc_switch(idx):
@@ -2710,9 +2721,7 @@ def _doc_open_untitled():
     d = {'open': True, 'path': None, 'dirty': False, 'state': {},
          'name': (T('doc.untitled') if n == 1
                   else '%s %d' % (T('doc.untitled'), n))}
-    _doc_list.append(d)
-    _doc = d
-    _doc_activate_tab(d)
+    _doc_spawn(d)
     # Empty slot -> globals + PANEL repaint. Without this the tree /
     # summary / detail view / green overlays kept showing the OUTGOING
     # document's rows (the model was already empty -- a display lie that
@@ -3074,8 +3083,7 @@ def _set_ui_mode(mode):
         clear_amp_regions()             # 切走即清除全部区域（用户要求）
     amp_recompute()
     _grab_roi_set_interactive(_grab_active())   # rects freeze outside event mode
-    _grab_show_selected()
-    _grab_show_overlays()
+    _grab_refresh_views()
     _refresh_mode_hints()
 
 
@@ -3088,8 +3096,7 @@ def _amp_col_toggled(*_):
         clear_amp_regions()
         amp_recompute()
         _grab_roi_set_interactive(_grab_active())
-        _grab_show_selected()
-        _grab_show_overlays()
+        _grab_refresh_views()
     _refresh_mode_hints()
 
 
@@ -3097,8 +3104,7 @@ def _event_panel_toggled(*_):
     """Event panel fold/unfold: folding freezes its rectangles and clears
     the green highlights (the records themselves stay)."""
     _grab_roi_set_interactive(_grab_active())
-    _grab_show_selected()
-    _grab_show_overlays()
+    _grab_refresh_views()
     _refresh_mode_hints()
 
 
@@ -3494,8 +3500,7 @@ def grab_drag_finish(x0, x1, y0, y1):
         if _grab_selected is not None:
             _grab_select(None)
         _grab_focus_gid = grp['id']
-        _grab_show_selected()
-        _grab_show_overlays()
+        _grab_refresh_views()
         return
     _grab_focus_gid = None
     _grab_sync_group(grp)
@@ -3776,8 +3781,7 @@ def _grab_roi_commit(grp):
     if grp['_first_eid'] is not None:
         _grab_select(grp['_first_eid'])
     _refresh_grab_list()
-    _grab_show_selected()
-    _grab_show_overlays()
+    _grab_refresh_views()
 
 
 def _grab_crop(x, y, t0, t1):
@@ -3929,6 +3933,20 @@ def _grab_add_event_curve(pi, x, y, width):
     return curve
 
 
+def _grab_stats_head(rec, group=False):
+    """Shared stats line: rank (+ group no), dwell, level, noise."""
+    if group:
+        return T('grab.stats.row', r=_grab_rank_of(rec),
+                 g=_grab_group_ranks().get(rec['gid'], 0),
+                 d=fmt_si(rec['dwell'], 's'),
+                 l=fmt_si(rec['y_level'], cur_yunit),
+                 s=fmt_si(rec['sigma'], cur_yunit))
+    return T('grab.stats.imp', r=_grab_rank_of(rec),
+             d=fmt_si(rec['dwell'], 's'),
+             l=fmt_si(rec['y_level'], cur_yunit),
+             s=fmt_si(rec['sigma'], cur_yunit))
+
+
 def _grab_stats_tip(grp):
     p = grp['params']
     rank = _grab_group_ranks().get(grp['id'], '?')
@@ -3946,16 +3964,9 @@ def _grab_stats_text(rec):
     grp = _grab_groups.get(rec['gid']) if rec['gid'] is not None else None
     if grp is None:
         grab_stats.setToolTip('')
-        return T('grab.stats.imp', r=_grab_rank_of(rec),
-                 d=fmt_si(rec['dwell'], 's'),
-                 l=fmt_si(rec['y_level'], cur_yunit),
-                 s=fmt_si(rec['sigma'], cur_yunit))
+        return _grab_stats_head(rec)
     grab_stats.setToolTip(_grab_stats_tip(grp))
-    head = T('grab.stats.row', r=_grab_rank_of(rec),
-             g=_grab_group_ranks().get(rec['gid'], 0),
-             d=fmt_si(rec['dwell'], 's'),
-             l=fmt_si(rec['y_level'], cur_yunit),
-             s=fmt_si(rec['sigma'], cur_yunit))
+    head = _grab_stats_head(rec, group=True)
     st = grp.get('stats') if grp else None
     if grp is not None and grp['error']:
         return ('%s<br><span style="color:%s">%s</span>'
@@ -4095,10 +4106,7 @@ def _grab_show_imported(rec):
             else:
                 hint = T('grab.imp.select', label=trace_label(idx))
         grab_stats.setText(
-            T('grab.stats.imp', r=_grab_rank_of(rec),
-              d=fmt_si(rec['dwell'], 's'),
-              l=fmt_si(rec['y_level'], cur_yunit),
-              s=fmt_si(rec['sigma'], cur_yunit))
+            _grab_stats_head(rec)
             + '<br>' + T('grab.notlive', hint=hint))
         return
     wx, wy = _grab_detail_windows()
@@ -4125,11 +4133,7 @@ def _grab_show_imported(rec):
                                    connect='finite'))
     if c is not None:
         _grab_add_event_curve(pi, c[0], c[1], 3)
-    grab_stats.setText(
-        T('grab.stats.imp', r=_grab_rank_of(rec),
-          d=fmt_si(rec['dwell'], 's'),
-          l=fmt_si(rec['y_level'], cur_yunit),
-          s=fmt_si(rec['sigma'], cur_yunit)))
+    grab_stats.setText(_grab_stats_head(rec))
     pi.setXRange(x0, x1, padding=0.02)
     ext = _grab_region_extent(x0, x1)
     if wy is not None and ext is not None:
@@ -4141,6 +4145,12 @@ def _grab_show_imported(rec):
                      padding=0)
     if last_data:
         pi.setLabels(bottom=('time', cur_xunit), left=('Y', cur_yunit))
+
+
+def _grab_refresh_views():
+    """Repaint selection + overlays (the standard post-change pair)."""
+    _grab_show_selected()
+    _grab_show_overlays()
 
 
 def _grab_show_selected():
@@ -4436,8 +4446,7 @@ def _grab_select(rid):
     if rec is not None:
         _grab_focus_gid = None          # an event selection replaces focus
     _grab_apply_selection_style()
-    _grab_show_selected()
-    _grab_show_overlays()
+    _grab_refresh_views()
 
 
 def _grab_update_summary():
@@ -4552,8 +4561,7 @@ def _grab_delete(rid):
         it = _grab_items.get(_grab_selected)
         if it is not None:
             grab_tree.setCurrentItem(it)
-        _grab_show_selected()
-        _grab_show_overlays()
+        _grab_refresh_views()
     _grab_apply_selection_style()
     _grab_update_summary()
 
@@ -4569,8 +4577,7 @@ def _grab_clear():
     _grab_selected = None
     _grab_focus_gid = None
     _refresh_grab_list()
-    _grab_show_selected()
-    _grab_show_overlays()
+    _grab_refresh_views()
 
 
 def _grab_delete_group_now(gid):
@@ -4587,8 +4594,7 @@ def _grab_delete_group_now(gid):
     _refresh_grab_list()
     if first is not None:
         _grab_select(first)
-    _grab_show_selected()
-    _grab_show_overlays()
+    _grab_refresh_views()
 
 
 def _delete_current_selection():
@@ -4756,8 +4762,7 @@ def _grab_recalc_all():
     if _grab_selected is not None and _grab_rec_by_id(_grab_selected) is None:
         _grab_selected = None
     _refresh_grab_list()
-    _grab_show_selected()
-    _grab_show_overlays()
+    _grab_refresh_views()
 
 
 class _CsvReject(Exception):
@@ -5037,9 +5042,7 @@ def _open_doc(path):
             return
     _doc_state_capture()
     d = {'open': True, 'path': absp, 'dirty': False, 'state': {}}
-    _doc_list.append(d)
-    _doc = d
-    _doc_activate_tab(d)
+    _doc_spawn(d)
     _apply_doc_params(params)
 
     # -- inject rows (groupless: the group machinery stays untouched)
