@@ -13,7 +13,8 @@ import numpy as np
 
 __all__ = ['noise_sigma', 'detect_events', 'detect_events_segments',
            'all_point_histogram', 'log_histogram', 'survival_function',
-           'fd_bin_count', 'in_band_fraction', 'EventResult', 'EVENT_DTYPE']
+           'fd_bin_count', 'in_band_fraction', 'slice_segments',
+           'EventResult', 'EVENT_DTYPE']
 
 # One detected event: boundary times (sub-sample interpolated), duration,
 # absolute mean level inside the event (first/last sample trimmed) and the
@@ -262,6 +263,41 @@ def detect_events_segments(segments, **kwargs):
     return EventResult(pooled,
                        float(np.sum(h_vals) / n), float(np.sum(sig_vals) / n),
                        boundary, duty_discarded)
+
+
+def slice_segments(segments, x0, x1, stride=1):
+    """Time-scope slices of (t, y) segments: keep samples with x0 <= t <= x1.
+
+    The GUI Grab tab uses this to restrict detection to a user-drawn
+    rectangle: slice FIRST, then run detect_events_segments on the slices.
+    An event cut by a slice edge is inside the band already at the slice's
+    first sample, so it lands in boundary_discarded -- "complete inside
+    only" semantics for free, consistent with whole-data detection.
+
+    Segments with no sample inside the span are dropped; stride subsamples
+    after slicing (live previews).
+
+    t must be monotonic non-decreasing (every producer builds axes that
+    way: arange*dt per trace, accumulated per sweep in stitch mode) -- the
+    searchsorted slice is then EXACTLY the boolean-mask membership without
+    the O(n) mask + fancy-index copy over the full axis, which the live
+    rectangle-drag preview cannot afford on ~1e7-sample stitched axes.
+    """
+    if x1 < x0:
+        x0, x1 = x1, x0
+    out = []
+    for t, y in segments:
+        i0 = int(np.searchsorted(t, x0, side='left'))
+        i1 = int(np.searchsorted(t, x1, side='right'))
+        if i1 <= i0:
+            continue
+        t2 = t[i0:i1]
+        y2 = y[i0:i1]
+        if stride > 1:
+            t2 = t2[::stride]
+            y2 = y2[::stride]
+        out.append((t2, y2))
+    return out
 
 
 def in_band_fraction(segments, mode, lo, hi):

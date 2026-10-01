@@ -1,4 +1,4 @@
-import os, sys, time
+import os, sys, time, csv, hashlib
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pyqtgraph as pg
 import numpy as np
@@ -15,9 +15,12 @@ THEME = {
     'B':          '#1F77B4',                    # B marker (blue)
     'readout':    '#1F1F1F',                    # readout text
     'readout_bg': (255, 255, 255, 190),         # translucent white panel
-    'seam':       '#B0B0B0',                    # stitch seam dashed lines
+    'seam':       '#B0B0B0',                    # join seam dashed lines
     'band':       '#76B7B2',                    # Detect threshold band (teal)
     'event':      '#59A14F',                    # event highlight / event hists
+    'import':     '#9C9C9C',                    # groupless imported rows (CSV v3)
+    'accent':     '#4E79A7',                    # mode-active highlight (Tableau blue)
+    'accent_tint': '#E3EDF6',                   # active-mode hint pill background
     # Tableau 10 for <= 10 traces; Tableau 20 (deep+light shades) for <= 20;
     # beyond that a muted golden-ratio hue walk -- distinguishable, no neon
     'cycle':      ['#4E79A7', '#F28E2B', '#E15759', '#76B7B2', '#59A14F',
@@ -73,6 +76,392 @@ app.setPalette(_pal)
 
 # Persistent settings (remembers the last opened directory across sessions)
 settings = pg.QtCore.QSettings('heka', 'browser')
+
+# -- UI language (zh default; switching writes the setting and asks for a
+# restart -- the UI is built once at module level, so live retranslation
+# is not worth the machinery). All user-visible strings go through T();
+# data-schema words (t_start/dwell/level/#, inside/outside/below/above,
+# CSV column names, units) stay English in BOTH languages on purpose.
+_ui_lang = settings.value('ui/lang', 'zh', type=str)
+if _ui_lang not in ('zh', 'en'):
+    _ui_lang = 'zh'
+
+L10N = {
+    'zh': {
+        'btn.load': '打开…', 'btn.auto': '自动', 'btn.follow': '跟随文件',
+        'btn.measure': '测量', 'btn.clear': '清除', 'btn.join': '拼接',
+        'btn.tip.lang': '切换界面语言（中/EN），重启后生效',
+        'tip.follow': '监视当前 .dat：Patchmaster 落盘新数据后自动重新解析并保持你的选中\n'
+                      '（≈按 sweep 级延迟；需 Patchmaster 开启按 sweep 落盘/自动保存）。\n'
+                      'F5 = 随时手动刷新。读到半截写入会静默跳过、下次文件变化自动重试。',
+        'lang.title': '语言', 'lang.ask': '语言已切换，重启后生效。现在重启吗？',
+        'sec.tree': '文件树', 'sec.nano': '纳米孔计算器', 'sec.info': '文件信息',
+        'sec.dist': '事件', 'amp.title': '幅度',
+        'exp.title': '文件', 'exp.csvonly': '仅 CSV',
+        'exp.tip.csvonly': '开启 = 只显示 *.csv 文件（目录始终显示）；\n关闭 = 显示全部文件。',
+        'exp.tip.up': '返回上级目录',
+        'exp.tip.refresh': '强制刷新当前目录（列表本身实时监听文件系统，\n同步盘偶发丢事件时兜底）。',
+        'exp.tip.list': '双击 CSV = 打开为分析文档（自举：定位溯源 .dat、选中对应 trace、恢复 Join）；\n双击目录 = 进入；其他文件双击无动作。\n选中一项后按 回车 / F2 = 重命名。',
+        'tree.node': '节点', 'tree.label': '标签', 'info.nofile': '未载入文件',
+        'dlg.open': '打开数据文件', 'reload.title': '重新加载',
+        'reload.fail': '解析失败：文件可能正在写入中，请稍后再试。',
+        'nano.solution': '溶液', 'nano.conc': '浓度 (M)',
+        'nano.thick': '膜厚 (nm)', 'nano.volt': '电压 (mV)', 'nano.current': '电流',
+        'amp.clear': '清空区域', 'amp.ruler': '峰标尺',
+        'amp.autobins': '自动 bins', 'amp.follow': '范围 = 视图Y',
+        'amp.tip.ruler': '在直方图上放置两条可拖动的横线 A/B，\n实时读取两个峰的位置与它们的差 Δ',
+        'amp.hint': '幅度模式已激活（本列被最后点击）：按住 <b>Shift</b> 在主图内'
+                    '<b>横向拖拽</b>框选时间区域（普通拖拽 = 平移，轴条拖拽 = 缩放）；'
+                    '点击下方事件面板切回事件抓取。',
+        'amp.hint.off': '点击本列任意处激活幅度模式：激活后按住 <b>Shift</b> 在主图内'
+                        '横向拖拽框选时间区域；折叠本列会清除全部区域。',
+        'amp.tip.hint': '按住 Shift 在主图内横向拖拽 = 框选时间区域（普通拖拽 = 平移，'
+                        '轴条拖拽 = 缩放），\n松开后该区域内的全部采样点进入左侧直方图'
+                        '（可叠加多个区域，各自统计）。\n'
+                        '拖区域边缘可继续调整，切换到事件面板或折叠本列会清除全部区域。\n'
+                        '窄列下提示文字会被截断——完整说明见此处。',
+        'amp.nosamples': '区域未覆盖任何采样点',
+        'amp.axisy': '区域样本占比 %',
+        'amp.over.commit': '<span style="color:{c}">事件数 {n} 超过上限 {cap}——'
+                           '请收小矩形范围（事件面板用于逐个甄别事件，'
+                           '批量分析请用 notebook + analysis.py）</span>',
+        'amp.over.edit': '<span style="color:{c}">事件数 {n} 超过上限 {cap}——'
+                         '编辑未生效，请收小矩形范围</span>',
+        'grab.hint': '事件模式已激活（本面板被最后点击）：<b>Shift+拖拽</b>画 XY 矩形'
+                     '（X=时间范围，Y=事件带）；范围内每个检出事件一行，'
+                     '拖四边/内部=整组重抓',
+        'grab.hint.off': '点击本面板任意处激活事件模式：激活后 <b>Shift+拖拽</b> 主图画'
+                         ' XY 检测矩形（X=时间范围，Y=事件带）。',
+        'grab.tip.hint': '按住 Shift 在主图内拖拽画 XY 矩形（X=分析时间范围，Y=事件判定带），\n'
+                         '松开即在范围内检测：每个检出事件成为右侧列表的一行（dwell 即该事件时长）。\n'
+                         '同一矩形抓出的事件为一组（同色、共用参数快照）。\n\n'
+                         '拖矩形四边（改范围）或内部（平移）松手后按当前参数整组重抓替换；\n'
+                         '被矩形边缘切断的事件按边界事件丢弃（完整在内才保留）。\n'
+                         '0 个事件时矩形保留，拖大边缘直到事件完整即可。\n\n'
+                         '参数为快照制：在抓取/改边时刻存入记录，之后改动不回溯已存记录，\n'
+                         '[全部重算] 才应用当前参数重跑全部同源记录。',
+        'grab.p.mode': '模式', 'grab.p.k': '滞回 k·σ', 'grab.p.tmin': '最短 (ms)',
+        'grab.p.merge': '合并 (s)', 'grab.p.head': '忽略开头 (ms)',
+        'grab.p.smooth': '检测平滑 (ms)', 'grab.p.duty': '带内占比 ≥',
+        'evt.tip.mode': '事件语义——四种模式共用同一套滞回/时长逻辑：\n'
+                        'inside = 带内即事件（默认；不假定基线，带子圈住哪个电平，那段驻留就是事件）\n'
+                        'outside = 带外即事件（基线在带中，上下双向尖峰）\n'
+                        'below = y < hi 即事件（经典向下阻断，只用上边一条线）\n'
+                        'above = y > lo 即事件（向上尖峰）',
+        'evt.tip.k': '滞回 k·σ —— 事件结束的防抖门槛。\n'
+                     '噪声会让信号在带沿反复进出；纯"进带=开始 / 出带=结束"会把一个真实\n'
+                     '事件拆成大量碎片。滞回要求信号明确离开带宽 k 倍噪声 σ 才认定结束\n'
+                     '（σ 由相邻采样差自动稳健估计，不受事件尖峰影响）。\n'
+                     '默认 3 适合多数数据；噪声大或 spike 密可加到 5–8；0 = 完全关闭滞回',
+        'evt.tip.tmin': '最短时长 —— 短于该时长的事件直接丢弃。\n'
+                        '滤掉电容毛刺与 spike 穿过带沿产生的 ~0.1–0.3 ms 碎片；\n'
+                        '两态驻留通常 ≥ 数 ms，所以 0.1–1 ms 很安全，只关心长驻留可加大到 10。\n'
+                        '内部按原始采样率换算成点数，开启平滑后自动再除以窗宽',
+        'evt.tip.merge': '合并 —— 相邻事件间隔小于该值时并成一个，把被 spike 短暂打断的\n'
+                         '真实驻留重新接上。\n'
+                         '⚠ 危险：spike 越密、碎片间隔越短，合并值过大会把整段信号串成一个\n'
+                         '巨型"假事件"（事件电平被带外间隙稀释）。spike 密集时保持 0，\n'
+                         '改用「检测平滑」压掉 spike +「带内占比」兜底',
+        'evt.tip.head': '忽略开头 —— 每条 sweep 开头切掉这段时间，规避电容充放电瞬态\n'
+                        '（本数据瞬态可达 ±2 nA，不切会在每个 sweep 开头产生假事件）。\n'
+                        '10 ms 覆盖绝大多数情况；Join 模式下每条 sweep 的开头都会切',
+        'evt.tip.smooth': '检测平滑 —— 检测前按窗宽做中位数压缩。\n'
+                          '比窗窄的 spike 被压平、比窗宽的电平台完整保留——spike 密集的\n'
+                          '两态数据的关键参数（建议 1–2 ms）。不开它时每个 spike 穿带都\n'
+                          '产生碎片；开了它 dwell/边界精度降为窗宽粒度（1 ms 窗 → 1 ms）。0 = 关闭',
+        'evt.tip.duty': '带内占比 —— 合并后事件跨度内真正在带内的时间占比，\n'
+                        '低于该值即丢弃：spike 顶部碎片链占比通常 ~3%，真实驻留 >50%，\n'
+                        '0.5 一刀分开。只对发生过合并的事件生效；0 = 关闭该过滤',
+        'grab.col.noise': '噪声',
+        'grab.viewall': '显示全部',
+        'grab.tip.viewall': '审计模式：主图保持当前缩放不变，把选中组的全部检出事件绿显\n'
+                            '（选中的加粗）——快速检查方块里有没有选进不要的内容。\n'
+                            '关闭 = 主图只显示选中的那一个事件。',
+        'grab.recalc': '全部重算',
+        'grab.tip.recalc': '用当前参数整组重抓所有仍对应本数据的记录\n（整组替换语义：手动删过的行会回来）',
+        'grab.clear': '清空',
+        'csv.imp.title': '导入事件 CSV', 'csv.exp.title': '导出事件 CSV',
+        'exp.rename.title': '重命名',
+        'exp.rename.exists': '“{name}”已存在。',
+        'exp.rename.badname': '名称不能为空，也不能包含 “/”。',
+        'exp.rename.fail': '无法重命名：{err}',
+        'doc.new': '新建分析文件', 'doc.newbtn': '新建',
+        'doc.empty.hint': '点击上方按钮开始圈选事件（Shift+拖拽主图画 XY 矩形），'
+                          '<br>或双击右侧文件列中的 CSV 直接打开已保存的分析。',
+        'doc.save': '保存', 'doc.saveas': '另存为…',
+        'doc.untitled': '未命名',
+        'doc.close.title': '关闭文档',
+        'doc.close.q': '“{name}”有未保存的修改（事件行）。保存并关闭、直接丢弃，还是取消？',
+        'doc.savefail': '无法写入文件：{err}',
+        'doc.empty.save': '当前没有事件行，保存的只会是表头——确定继续吗？',
+        'csv.readfail': '无法读取文件：{err}',
+        'csv.v2': '这是 v2 分组格式（含 group_id 列）——v3 起导出为扁平事件表、'
+                  '不再存储分组信息，v2 已不再支持。',
+        'csv.missing': '文件缺少必需列：{cols}\n请使用本版本导出的 grab CSV（v4 扁平事件表；'
+                       'v3 旧格式自动兼容，v2 及更早的分组格式已不再支持）。',
+        'csv.empty': '文件没有数据行。',
+        'csv.nousable': '没有可用的记录{bad}。',
+        'csv.badrows': '（{n} 行解析失败）',
+        'csv.locate': '定位来源数据文件{suffix}',
+        'csv.openfail': '无法打开来源文件，相关行按灰显导入：{err}',
+        'csv.report': '已导入 {n} 行：\n· {notes}',
+        'csv.note.bad': '{n} 行解析失败被跳过',
+        'csv.note.live': '{n} 行挂到当前显示',
+        'csv.note.infile': '{n} 行在当前文件但未挂到显示（选中对应 trace / 匹配 Join 状态即亮）',
+        'csv.note.other': '{n} 行来自其他数据（灰显，快照保留）',
+        'csv.note.cand': '部分 trace 指纹有多条同名候选，按路径就近对齐（请核对）',
+        'csv.note.content': '部分 trace 已按内容指纹对齐（原路径已漂移）',
+        'grab.imp.otherfile': '来自其他数据（文件不匹配，快照保留）',
+        'grab.imp.otherref': '来自其他数据（trace 指纹未匹配，快照保留）',
+        'grab.imp.joinflip': '当前文件的 {label} —— 把 Join {sw}并选中该 trace 即亮',
+        'grab.imp.select': '当前文件的 {label} —— 树里选中该 trace 即亮',
+        'grab.w.on': '开', 'grab.w.off': '关',
+        'grab.notlive': '<span style="color:#999">未挂到当前显示：{hint}</span>',
+        'grab.stats.imp': '<b>#{r} · 导入行 · dwell {d} · level {l} · 噪声 ±{s}</b>',
+        'grab.stats.row': '<b>#{r} · 组#{g} · dwell {d} · level {l} · 噪声 ±{s}</b>',
+        'grab.w.grp': '组#{r}', 'grab.w.grp.short': '组#{r}',
+        'grab.w.noise': '噪声 ±{v}',
+        'grab.stats.bd': '边界丢弃 {n}', 'grab.stats.dd': '占比丢弃 {n}',
+        'grab.w.nev': '{n} 个事件', 'grab.w.preview': '预览 {n} 个事件',
+        'grab.overlimit': '<br><span style="color:{c}">超过上限 {cap}，松手会拒绝——收小矩形范围</span>',
+        'grab.nofull': '<br><span style="color:#999">范围内没有完整事件</span>'
+                       '（边界丢弃 {n}：事件被矩形边缘切断，把边缘拖离它即可收全；或检查 Y 带与参数）',
+        'grab.grp.err': '<b>组#{r} · {a} – {b} s</b><br><span style="color:{c}">{e}</span>',
+        'grab.grp.head': '<b>组#{r} · {a} – {b} s · {tag}{noise}</b>',
+        'grab.allgrey': '<span style="color:#999">{n} 条记录均来自其他数据（树选择/文件已切换）'
+                        '——事件与统计仍是快照；切回对应数据后矩形自动恢复、可继续编辑。</span>',
+        'grab.norec': '<span style="color:#999">没有记录：按住 <b>Shift</b> '
+                      '在主图内拖拽 XY 矩形，范围内每个检出事件一行。</span>',
+        'grab.otherdata.rec': '<b>#{r} · 组#{g}</b> 来自其他数据（树选择/文件已切换）——'
+                              'dwell/level 仍是抓取时的快照：<br>{stats}',
+        'grab.otherdata.grp': '<b>组#{r}</b> 来自其他数据——切回对应数据后矩形自动恢复。',
+        'grab.summary': 'N={n} · 均 dwell {dm} · level {lm} · 噪声 ±{sm}<br>'
+                        '中位 dwell {dd} · level {ld} · 噪声 ±{sd}',
+        'grab.tip.grp': '组 #{rank} 参数（快照于抓取/改边时刻，编辑=整组重抓）：\n'
+                        '模式 {mode} · 滞回 k={k} · 最短 {tmin} ms · 合并 {merge} s\n'
+                        '忽略开头 {head} ms · 检测平滑 {smooth} ms · 带内占比 ≥{duty}\n'
+                        '矩形范围 {x0} – {x1} s · Y 带 {y0} – {y1}（原生单位）\n\n'
+                        '噪声 ± = 该事件跨度内 90% 采样所在的波动带半宽（p5–p95 分位\n'
+                        '包络，围绕事件电平，含 spike 穿刺与慢纹波；孤立单点毛刺\n'
+                        '占比 <5% 会被折价），逐事件独立计算，单位 = 电流/电压原生单位。\n\n'
+                        '整组替换：拖动矩形重新检测会用新结果替换该组全部行\n'
+                        '（手动删过的行会回来）。手动删除某行只删那一个事件；\n'
+                        '组内最后一行删掉时矩形一并移除。\n\n'
+                        '边界丢弃 = 事件被矩形边缘切断（进入或离开发生在范围外），\n'
+                        '完整落在范围内的事件才保留；想收全某个事件就把矩形边缘拖离它。',
+        'del.rect.title': '删除矩形',
+        'del.rect.confirm': '组#{r} 的矩形带 {n} 条事件行，矩形与行将一并删除。继续？',
+    },
+    'en': {
+        'btn.load': 'Load...', 'btn.auto': 'Auto', 'btn.follow': 'Follow file',
+        'btn.measure': 'Measure', 'btn.clear': 'Clear', 'btn.join': 'Join',
+        'btn.tip.lang': 'Switch the UI language (zh/EN); takes effect after restart',
+        'tip.follow': 'Watch the current .dat: re-parse automatically as Patchmaster\n'
+                      'flushes new data, keeping your selection (≈ per-sweep latency;\n'
+                      'needs Patchmaster per-sweep saving/auto-save).\n'
+                      'F5 = manual refresh. Half-written reads are skipped silently\n'
+                      'and retried on the next file change.',
+        'lang.title': 'Language', 'lang.ask': 'Language switched; it takes effect after a restart. Restart now?',
+        'sec.tree': 'File tree', 'sec.nano': 'Nanopore calculator', 'sec.info': 'File info',
+        'sec.dist': 'Events', 'amp.title': 'Amplitude',
+        'exp.title': 'Files', 'exp.csvonly': 'CSV only',
+        'exp.tip.csvonly': 'On = show only *.csv files (directories always shown);\noff = show everything.',
+        'exp.tip.up': 'Go to the parent directory',
+        'exp.tip.refresh': 'Force a refresh of the current directory (the list watches\nthe filesystem live; fallback for synced folders).',
+        'exp.tip.list': 'Double-click a CSV = open it as an analysis document (bootstraps '
+                        'the source .dat, selects the referenced traces, restores Join);\n'
+                        'double-click a directory = enter; other files do nothing.\n'
+                        'Select an item and press Return / F2 = rename it.',
+        'tree.node': 'Node', 'tree.label': 'Label', 'info.nofile': 'no file loaded',
+        'dlg.open': 'Open data file', 'reload.title': 'Reload',
+        'reload.fail': 'Parse failed: the file may be mid-write; try again shortly.',
+        'nano.solution': 'Solution', 'nano.conc': 'Concentration (M)',
+        'nano.thick': 'Membrane thickness (nm)', 'nano.volt': 'Voltage (mV)', 'nano.current': 'Current',
+        'amp.clear': 'Clear regions', 'amp.ruler': 'Peak ruler',
+        'amp.autobins': 'auto bins', 'amp.follow': 'range = view Y',
+        'amp.tip.ruler': 'Two draggable horizontal markers A/B on the histogram;\n'
+                         'reads both peak positions and their difference Δ live.',
+        'amp.hint': 'Amplitude mode armed (this column was clicked last): '
+                    '<b>Shift+drag horizontally</b> in the main plot to select '
+                    'time regions (plain drag = pan, axis-band drag = zoom); '
+                    'click the Event panel below to switch back to event grabs.',
+        'amp.hint.off': 'Click anywhere in this column to arm amplitude mode: '
+                        'then Shift+drag horizontally in the main plot to band '
+                        'time regions; folding this column clears all regions.',
+        'amp.tip.hint': 'Shift+drag horizontally in the main plot = select a time '
+                        'region (plain drag = pan, axis-band drag = zoom);\n'
+                        'on release every raw sample inside it joins the histogram '
+                        '(regions stack, each with its own stats).\n'
+                        'Drag a region edge to adjust; switching to the Event panel '
+                        'or folding this column clears all regions.\n'
+                        'The hint text clips in a narrow column -- full wording here.',
+        'amp.nosamples': 'regions cover no samples',
+        'amp.axisy': '% of region samples',
+        'amp.over.commit': '<span style="color:{c}">{n} events exceed the cap {cap} -- '
+                           'shrink the rectangle (the Event panel curates events one by one; '
+                           'use the notebook + analysis.py for batch work)</span>',
+        'amp.over.edit': '<span style="color:{c}">{n} events exceed the cap {cap} -- '
+                         'edit refused, shrink the rectangle</span>',
+        'grab.hint': 'Event mode armed (this panel was clicked last): <b>Shift+drag</b> '
+                     'an XY rectangle (X = time scope, Y = event band); each detected '
+                     'event becomes a row; drag edges/inside = re-grab',
+        'grab.hint.off': 'Click anywhere in this panel to arm event mode: then '
+                         '<b>Shift+drag</b> in the main plot draws an XY detection '
+                         'rectangle (X = time scope, Y = event band).',
+        'grab.tip.hint': 'Hold Shift and drag an XY rectangle in the main plot (X = analysis\n'
+                         'time scope, Y = event band); release runs detection inside it: every\n'
+                         'detected event becomes a row in the list (dwell = that event\'s duration).\n'
+                         'Events from one rectangle form a group (same colour, shared param snapshot).\n\n'
+                         'Dragging an edge (resize) or the inside (move) re-detects on release and\n'
+                         'REPLACES the whole group with the current parameters; events cut by the\n'
+                         'rectangle edge are dropped as boundary events (only fully-inside ones stay).\n'
+                         'With 0 events the rectangle stays -- enlarge it until the event fits.\n\n'
+                         'Parameters are snapshotted at grab/edit time and never back-applied;\n'
+                         '[Recalc all] re-runs every still-matching record with the current ones.',
+        'grab.p.mode': 'Mode', 'grab.p.k': 'Hysteresis k·σ', 'grab.p.tmin': 'Min (ms)',
+        'grab.p.merge': 'Merge (s)', 'grab.p.head': 'Skip head (ms)',
+        'grab.p.smooth': 'Smooth (ms)', 'grab.p.duty': 'In-band duty ≥',
+        'evt.tip.mode': 'Event semantics -- all four modes share the hysteresis/duration logic:\n'
+                        'inside = in-band is an event (default; no baseline assumed)\n'
+                        'outside = out-of-band is an event (baseline mid-band, spikes both ways)\n'
+                        'below = y < hi is an event (classic downward blockade, upper line only)\n'
+                        'above = y > lo is an event (upward spikes)',
+        'evt.tip.k': 'Hysteresis k·σ -- the debounce threshold for event END.\n'
+                     'Noise makes the signal chatter across the band edge; a plain\n'
+                     '"in = start / out = end" rule shatters one real event into many\n'
+                     'fragments. Hysteresis demands a clear exit of k noise sigmas\n'
+                     '(σ robustly estimated from neighbouring samples, immune to spikes).\n'
+                     '3 suits most data; noisy or spike-dense traces may need 5-8; 0 = off',
+        'evt.tip.tmin': 'Minimum duration -- shorter events are dropped outright.\n'
+                        'Filters capacitive glitches and the ~0.1-0.3 ms fragments spikes\n'
+                        'leave crossing the band edge; two-state dwells are usually >= ms,\n'
+                        'so 0.1-1 ms is safe (raise to 10 for long dwells only).\n'
+                        'Converted to samples at the raw rate; divided by the window if smoothing is on',
+        'evt.tip.merge': 'Merge -- adjacent events closer than this are glued back together,\n'
+                         'rejoining real dwells that a spike briefly interrupted.\n'
+                         '⚠ Dangerous: the denser the spikes, the shorter the gaps -- too large a\n'
+                         'value welds the whole trace into one giant "pseudo-event" (its level\n'
+                         'diluted by out-of-band gaps). Keep 0 for dense spikes; use smoothing\n'
+                         '+ the in-band duty guard instead',
+        'evt.tip.head': 'Skip head -- this much time is cut from every sweep start, dodging\n'
+                        'the capacitive transient (here up to ±2 nA; uncut it fakes an event\n'
+                        'at every sweep start). 10 ms covers nearly everything; with Join on,\n'
+                        'every sweep\'s head is cut',
+        'evt.tip.smooth': 'Detection smoothing -- median-of-window decimation before detecting.\n'
+                          'Spikes narrower than the window flatten, plateaus wider than it survive\n'
+                          'intact -- the key parameter for spike-dense two-state data (1-2 ms\n'
+                          'recommended). Without it every spike crossing shards the event; with it\n'
+                          'dwell/boundary precision drops to the window grain (1 ms -> 1 ms). 0 = off',
+        'evt.tip.duty': 'In-band duty -- the fraction of a MERGED event span actually spent\n'
+                        'in band; below this the event is dropped: spike-top fragment chains\n'
+                        'sit near ~3%, real dwells >50%, so 0.5 splits them cleanly.\n'
+                        'Applies only to merged events; 0 = off',
+        'grab.col.noise': 'noise',
+        'grab.viewall': 'Show all',
+        'grab.tip.viewall': 'Audit mode: keep the main-plot zoom and show EVERY detected event\n'
+                            'of the selected group in green (selected one bold) -- quickly check\n'
+                            'nothing unwanted slipped into the rectangle. Off = only the selected event.',
+        'grab.recalc': 'Recalc all',
+        'grab.tip.recalc': 'Re-grab every record still matching this data with the current\nparameters (whole-group replace: manually deleted rows come back)',
+        'grab.clear': 'Clear',
+        'csv.imp.title': 'Import event CSV', 'csv.exp.title': 'Export event CSV',
+        'exp.rename.title': 'Rename',
+        'exp.rename.exists': '"{name}" already exists.',
+        'exp.rename.badname': 'The name must not be empty or contain "/".',
+        'exp.rename.fail': 'Could not rename: {err}',
+        'doc.new': 'New analysis file', 'doc.newbtn': 'New',
+        'doc.empty.hint': 'Click the button above and Shift+drag an XY rectangle in the '
+                          'main plot to start grabbing events,<br>or double-click a CSV '
+                          'in the file column to open a saved analysis.',
+        'doc.save': 'Save', 'doc.saveas': 'Save As…',
+        'doc.untitled': 'untitled',
+        'doc.close.title': 'Close document',
+        'doc.close.q': '"{name}" has unsaved changes (event rows). Save & close, discard, or cancel?',
+        'doc.savefail': 'Could not write the file: {err}',
+        'doc.empty.save': 'There are no event rows -- the file would hold only the header. Continue?',
+        'csv.readfail': 'Cannot read the file: {err}',
+        'csv.v2': 'v2 grouped format (group_id column) -- exports are flat since v3 and no '
+                  'longer store grouping; v2 is no longer supported.',
+        'csv.missing': 'Missing required columns: {cols}\nUse a grab CSV exported by this '
+                       'version (v4 flat table; v3 auto-maps; v2 and older grouped formats '
+                       'are no longer supported).',
+        'csv.empty': 'The file has no data rows.',
+        'csv.nousable': 'No usable records{bad}.',
+        'csv.badrows': ' ({n} rows failed to parse)',
+        'csv.confirm': 'There are already {n} records; importing replaces them (unexported '
+                       'curation is lost). Continue?',
+        'csv.locate': 'Locate the source data file{suffix}',
+        'csv.openfail': 'Cannot open the source file; those rows import grey: {err}',
+        'csv.report': 'Imported {n} rows:\n· {notes}',
+        'csv.note.bad': '{n} rows skipped (parse failed)',
+        'csv.note.live': '{n} rows attached to the current display',
+        'csv.note.infile': '{n} rows in the current file but not on the display (select their '
+                           'trace / match the Join state to light them up)',
+        'csv.note.other': '{n} rows from other data (grey snapshots kept)',
+        'csv.note.cand': 'Some trace fingerprints have several same-name candidates; aligned '
+                         'by path proximity (please verify)',
+        'csv.note.content': 'Some traces aligned by content fingerprint (the original path drifted)',
+        'grab.imp.otherfile': 'from other data (file mismatch; snapshot kept)',
+        'grab.imp.otherref': 'from other data (trace fingerprint unmatched; snapshot kept)',
+        'grab.imp.joinflip': '{label} of the current file -- turn Join {sw} and select that '
+                             'trace to light it up',
+        'grab.imp.select': '{label} of the current file -- select that trace in the tree to '
+                           'light it up',
+        'grab.w.on': 'on', 'grab.w.off': 'off',
+        'grab.notlive': '<span style="color:#999">Not on the current display: {hint}</span>',
+        'grab.stats.imp': '<b>#{r} · imported · dwell {d} · level {l} · noise ±{s}</b>',
+        'grab.stats.row': '<b>#{r} · grp#{g} · dwell {d} · level {l} · noise ±{s}</b>',
+        'grab.w.grp': 'grp#{r}', 'grab.w.grp.short': 'grp#{r}',
+        'grab.w.noise': 'noise ±{v}',
+        'grab.stats.bd': 'boundary-cut {n}', 'grab.stats.dd': 'duty-cut {n}',
+        'grab.w.nev': '{n} events', 'grab.w.preview': 'preview of {n} events',
+        'grab.overlimit': '<br><span style="color:{c}">over the cap {cap}, release will refuse '
+                          '-- shrink the rectangle</span>',
+        'grab.nofull': '<br><span style="color:#999">no complete event in range</span>'
+                       '(boundary-cut {n}: the event crosses the rectangle edge; drag the edge '
+                       'off it to collect it whole; or check the Y band and parameters)',
+        'grab.grp.err': '<b>grp#{r} · {a} – {b} s</b><br><span style="color:{c}">{e}</span>',
+        'grab.grp.head': '<b>grp#{r} · {a} – {b} s · {tag}{noise}</b>',
+        'grab.allgrey': '<span style="color:#999">all {n} records are from other data (tree/file '
+                        'switched) -- events and stats stay snapshots; rectangles re-attach '
+                        'automatically once the data is back.</span>',
+        'grab.norec': '<span style="color:#999">No records yet: <b>Shift+drag</b> an XY '
+                      'rectangle in the main plot; every detected event inside becomes a row.</span>',
+        'grab.otherdata.rec': '<b>#{r} · grp#{g}</b> from other data (tree/file switched) -- '
+                              'dwell/level keep their grab-time snapshot:<br>{stats}',
+        'grab.otherdata.grp': '<b>grp#{r}</b> from other data -- rectangles re-attach once the '
+                              'matching data is back.',
+        'grab.summary': 'N={n} · mean dwell {dm} · level {lm} · noise ±{sm}<br>'
+                        'median dwell {dd} · level {ld} · noise ±{sd}',
+        'grab.tip.grp': 'Group #{rank} parameters (snapshotted at grab/edit time; editing = '
+                        'whole-group re-grab):\n'
+                        'mode {mode} · hysteresis k={k} · min {tmin} ms · merge {merge} s\n'
+                        'skip head {head} ms · smoothing {smooth} ms · in-band duty ≥{duty}\n'
+                        'rectangle {x0} – {x1} s · Y band {y0} – {y1} (native unit)\n\n'
+                        'noise ± = half-width of the band holding 90% of the samples inside the '
+                        'event span (p5–p95 quantile envelope around the event level, spike '
+                        'piercings and slow ripple included; lone one-sample glitches below a 5% '
+                        'share are discounted), computed per event, in the native current/voltage '
+                        'unit.\n\n'
+                        'Whole-group replace: re-detecting via the rectangle replaces ALL rows of '
+                        'the group (manually deleted rows come back). Deleting one row removes '
+                        'only that event; deleting the last row of a group removes the rectangle '
+                        'too.\n\n'
+                        'Boundary-cut = the event crosses the rectangle edge (entry or exit lies '
+                        'outside the range); only fully-inside events are kept -- drag the edge '
+                        'off an event to collect it whole.',
+        'del.rect.title': 'Delete rectangle',
+        'del.rect.confirm': 'The rectangle of grp#{r} carries {n} event rows; rectangle and '
+                            'rows are deleted together. Continue?',
+    },
+}
+
+
+def T(key, **fmt):
+    s = L10N.get(_ui_lang, L10N['zh']).get(key) or L10N['zh'].get(key, key)
+    return s.format(**fmt) if fmt else s
+
+
 # Configure Qt GUI:
 
 # Collapsible titled section: a one-line header with a fold arrow; folding
@@ -118,10 +507,17 @@ class Collapsible(pg.QtWidgets.QWidget):
         if isinstance(sp, pg.QtWidgets.QSplitter):
             idx = sp.indexOf(self)
             sizes = sp.sizes()
-            if collapsed:
-                sizes[idx] = self.btn.sizeHint().height() + 4   # keep header clickable
-            else:
-                sizes[idx] = getattr(self, '_restore', 0) or 150
+            strip = self.btn.sizeHint().height() + 4   # keep header clickable
+            want = strip if collapsed else (getattr(self, '_restore', 0) or 150)
+            delta = int(want) - sizes[idx]
+            sizes[idx] += delta
+            if delta:
+                # keep the list summing to the splitter's height (see the
+                # sideways twin CollapsibleColumn for the rationale)
+                k = max((j for j in range(len(sizes)) if j != idx),
+                        key=lambda j: sizes[j], default=None)
+                if k is not None:
+                    sizes[k] -= delta
             sp.setSizes([int(s) for s in sizes])
 
     def is_collapsed(self):
@@ -129,6 +525,81 @@ class Collapsible(pg.QtWidgets.QWidget):
 
     def add_widget(self, w):
         self.body_lay.addWidget(w)
+
+
+class CollapsibleColumn(pg.QtWidgets.QWidget):
+    """Sideways sibling of Collapsible: a column in a HORIZONTAL splitter
+    that folds to a slim strip (just the fold button). Same trick as
+    Collapsible with width instead of height -- merely hiding the body
+    shrinks nothing because QSplitter keeps the space reserved."""
+    def __init__(self, title):
+        super().__init__()
+        self._title = title
+        self._collapsed = False
+        lay = pg.QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        self.btn = pg.QtWidgets.QToolButton()
+        self.btn.setText('\u00bb ' + title)
+        self.btn.setToolButtonStyle(pg.QtCore.Qt.ToolButtonTextOnly)
+        self.btn.setStyleSheet('QToolButton { border: none; text-align: left;'
+                               ' padding: 2px; font-weight: bold; }')
+        self.btn.clicked.connect(self._toggle)
+        lay.addWidget(self.btn)
+        self.body = pg.QtWidgets.QWidget()
+        self.body_lay = pg.QtWidgets.QVBoxLayout(self.body)
+        self.body_lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(self.body, 1)
+
+    def _toggle(self):
+        self.set_collapsed(not self._collapsed)
+
+    def strip_width(self):
+        """Folded-strip width (the fold button's cross-axis hint)."""
+        return self.btn.sizeHint().height() + 4
+
+    def _splitter_assign(self, want):
+        """Give this pane `want` px in its parent splitter, handing the
+        difference to the widest sibling so the list still sums to the
+        splitter's width: a lopsided request makes QSplitter
+        redistribute the surplus per size hints, which is how panes
+        used to spring back open."""
+        sp = self.parentWidget()
+        if not isinstance(sp, pg.QtWidgets.QSplitter):
+            return
+        idx = sp.indexOf(self)
+        sizes = sp.sizes()
+        delta = int(want) - sizes[idx]
+        if not delta:
+            return
+        sizes[idx] += delta
+        k = max((j for j in range(len(sizes)) if j != idx),
+                key=lambda j: sizes[j], default=None)
+        if k is not None:
+            sizes[k] -= delta
+        sp.setSizes([int(s) for s in sizes])
+
+    def set_collapsed(self, collapsed):
+        collapsed = bool(collapsed)
+        if collapsed == self._collapsed:
+            return
+        self._collapsed = collapsed
+        self.body.setVisible(not collapsed)
+        sp = self.parentWidget()
+        if collapsed:
+            self._restore = (sp.sizes()[sp.indexOf(self)]
+                             if isinstance(sp, pg.QtWidgets.QSplitter) else 0)
+            self.setMaximumWidth(self.strip_width())
+            self.btn.setText('\u00ab')
+        else:
+            self.setMaximumWidth(16777215)
+            self.btn.setText('\u00bb ' + self._title)
+        want = self.strip_width() if collapsed \
+            else (getattr(self, '_restore', 0) or 200)
+        self._splitter_assign(want)
+
+    def is_collapsed(self):
+        return self._collapsed
 
 
 # Main window + splitters to let user resize panes
@@ -159,35 +630,71 @@ btn_row.setLayout(w1l)
 left_lay.addWidget(btn_row, 0, 0)
 
 # Button for loading .dat file
-load_btn = pg.QtWidgets.QPushButton("Load...")
+load_btn = pg.QtWidgets.QPushButton(T('btn.load'))
 w1l.addWidget(load_btn, 0, 0)
 
 # Button to auto-fit X/Y axes to the displayed data
-auto_btn = pg.QtWidgets.QPushButton("Auto")
+auto_btn = pg.QtWidgets.QPushButton(T('btn.auto'))
 w1l.addWidget(auto_btn, 0, 1)
 
+# Checkable follow mode: watch the loaded .dat on disk and re-parse it
+# whenever Patchmaster appends data (near-live feedback per sweep); F5 is
+# the manual counterpart. Not persisted -- always off at launch.
+follow_btn = pg.QtWidgets.QPushButton(T('btn.follow'))
+follow_btn.setCheckable(True)
+follow_btn.setToolTip(T('tip.follow'))
+w1l.addWidget(follow_btn, 0, 2)
+
 # Checkable button toggling click-to-measure mode on the plot
-measure_btn = pg.QtWidgets.QPushButton("Measure")
+measure_btn = pg.QtWidgets.QPushButton(T('btn.measure'))
 measure_btn.setCheckable(True)
 w1l.addWidget(measure_btn, 1, 0)
 
 # Button clearing all measurement markers
-clear_btn = pg.QtWidgets.QPushButton("Clear")
+clear_btn = pg.QtWidgets.QPushButton(T('btn.clear'))
 w1l.addWidget(clear_btn, 1, 1)
 
-# Checkable button toggling end-to-end stitching of multi-selected traces
-stitch_btn = pg.QtWidgets.QPushButton("Stitch")
-stitch_btn.setCheckable(True)
-stitch_btn.setChecked(settings.value('stitch', False, type=bool))
-w1l.addWidget(stitch_btn, 1, 2, 1, 2)
+# Checkable button toggling end-to-end joining of multi-selected traces
+join_btn = pg.QtWidgets.QPushButton(T('btn.join'))
+join_btn.setCheckable(True)
+# settings key was 'stitch' before the Join rename -- read-migrate
+_join_saved = settings.value('join', None)
+if _join_saved is None:
+    _join_saved = settings.value('stitch', False, type=bool)
+join_btn.setChecked(bool(_join_saved))
+w1l.addWidget(join_btn, 1, 2, 1, 2)
+
+# Language switch: writes ui/lang and offers a restart (the whole UI is
+# built at module level, so the new language lands on the next launch)
+lang_btn = pg.QtWidgets.QPushButton('EN' if _ui_lang == 'zh' else '中文')
+lang_btn.setToolTip(T('btn.tip.lang'))
+w1l.addWidget(lang_btn, 0, 3)
+
+
+def _lang_clicked():
+    settings.setValue('ui/lang', 'en' if _ui_lang == 'zh' else 'zh')
+    ans = pg.QtWidgets.QMessageBox.question(
+        win, T('lang.title'), T('lang.ask'),
+        pg.QtWidgets.QMessageBox.Yes | pg.QtWidgets.QMessageBox.No,
+        pg.QtWidgets.QMessageBox.Yes)
+    if ans == pg.QtWidgets.QMessageBox.Yes:
+        if getattr(sys, 'frozen', False):
+            _args = [sys.executable]
+        else:
+            _args = [sys.executable, os.path.abspath(__file__)]
+        pg.QtCore.QProcess.startDetached(sys.executable, _args)
+        win.close()
+
+
+lang_btn.clicked.connect(lambda *_: _lang_clicked())
 
 # Amplitude-region and event-detection controls live inside the Distribution
 # panel tabs below the plot (see the distribution section), not up here.
 
 # Collapsible section: file tree
-sec_tree = Collapsible('File tree')
+sec_tree = Collapsible(T('sec.tree'))
 tree = pg.QtWidgets.QTreeWidget()
-tree.setHeaderLabels(['Node', 'Label'])
+tree.setHeaderLabels([T('tree.node'), T('tree.label')])
 tree.setColumnWidth(0, 200)
 tree.setSelectionMode(pg.QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
 sec_tree.add_widget(tree)
@@ -195,7 +702,7 @@ vsplit.addWidget(sec_tree)
 
 # Read-only path bar showing the full path of the loaded file.
 # Text is selectable so the absolute path can be copied (Cmd+C / Cmd+A).
-path_label = pg.QtWidgets.QLineEdit('no file loaded')
+path_label = pg.QtWidgets.QLineEdit(T('info.nofile'))
 path_label.setReadOnly(True)
 path_label.setStyleSheet('QLineEdit { border: none; background: transparent; color: gray; }')
 
@@ -211,11 +718,14 @@ legend = plot.addLegend(brush=pg.mkBrush(255, 255, 255, 200),
                         pen=pg.mkPen('#CCCCCC'),
                         labelTextColor=THEME['fg'])
 
-# Right column: main plot on top, collapsible Distribution panel below
-# (see the distribution section further down); the splitter keeps a fixed
-# panel height while the traces take the rest.
+# Right column: main plot + collapsible Amplitude column side by side on
+# top, collapsible Event panel below (see the analysis sections further
+# down); the splitters keep a fixed panel height while the traces take
+# the rest. top_split is horizontal: [main plot | amp column].
 dist_split = pg.QtWidgets.QSplitter(pg.QtCore.Qt.Vertical)
-dist_split.addWidget(plot)
+top_split = pg.QtWidgets.QSplitter(pg.QtCore.Qt.Horizontal)
+top_split.addWidget(plot)
+dist_split.addWidget(top_split)
 right_col = pg.QtWidgets.QWidget()
 right_lay = pg.QtWidgets.QGridLayout()
 right_lay.setContentsMargins(0, 0, 0, 0)
@@ -234,7 +744,7 @@ def load_clicked():
     # Start in the directory of the last opened file
     start_dir = settings.value('last_dir', '')
     file_name, _ = pg.QtWidgets.QFileDialog.getOpenFileName(
-        None, 'Open data file', start_dir, 'Heka bundle (*.dat)')
+        None, T('dlg.open'), start_dir, 'Heka bundle (*.dat)')
     if file_name == '':
         return
     load(file_name)
@@ -324,7 +834,7 @@ plot.getPlotItem().getViewBox().sigRangeChanged.connect(lambda *a: place_readout
 
 meas_points = []
 meas_items = []
-stitch_segments = []
+join_segments = []
 cur_xunit = 's'
 cur_yunit = 'A'
 last_mouse = None
@@ -355,8 +865,8 @@ def format_point(px, py, name=''):
 
 
 def segment_at(x):
-    """Text of the stitched segment containing x ('' outside stitch mode)."""
-    for x0, x1, text in stitch_segments:
+    """Text of the joined segment containing x ('' outside join mode)."""
+    for x0, x1, text in join_segments:
         if x0 <= x < x1:
             return text
     return ''
@@ -665,16 +1175,16 @@ class NanoporePanel(pg.QtWidgets.QWidget):
 
         self.salt = pg.QtWidgets.QComboBox()
         self.salt.addItems(['KCl', 'NaCl', 'LiCl'])
-        form.addRow('Solution', self.salt)
+        form.addRow(T('nano.solution'), self.salt)
 
         self.conc = NumericEdit(1.0, 0.001, 5.0, change_cb=self.refresh)
-        form.addRow('Concentration (M)', self.conc)
+        form.addRow(T('nano.conc'), self.conc)
 
         self.thick = NumericEdit(20.0, 1.0, 100.0, change_cb=self.refresh)
-        form.addRow('Membrane thickness (nm)', self.thick)
+        form.addRow(T('nano.thick'), self.thick)
 
         self.volt = NumericEdit(100.0, 0.001, 10000.0, change_cb=self.refresh)
-        form.addRow('Voltage (mV)', self.volt)
+        form.addRow(T('nano.volt'), self.volt)
 
         curr_row = pg.QtWidgets.QWidget()
         curr_lay = pg.QtWidgets.QHBoxLayout(curr_row)
@@ -684,7 +1194,7 @@ class NanoporePanel(pg.QtWidgets.QWidget):
         self.unit.addItems(['nA', 'pA'])
         curr_lay.addWidget(self.curr)
         curr_lay.addWidget(self.unit)
-        form.addRow('Current', curr_row)
+        form.addRow(T('nano.current'), curr_row)
 
         self.sigma_out = pg.QtWidgets.QLineEdit()
         self.sigma_out.setReadOnly(True)
@@ -718,16 +1228,20 @@ class NanoporePanel(pg.QtWidgets.QWidget):
 
 # Panel instance, docked between the file tree and the file info section
 nano = NanoporePanel()
-sec_nano = Collapsible('Nanopore calculator')
+sec_nano = Collapsible(T('sec.nano'))
 sec_nano.add_widget(nano)
 vsplit.addWidget(sec_nano)
 
 
-# Collapsible section: file path + metadata tree
-sec_info = Collapsible('File info')
+# Collapsible section: file path + metadata tree. Docks at the TOP of the
+# left column (insertWidget(0, ...) -- it is constructed after sec_tree),
+# and its explicit zero minimum lets the splitter squeeze it far below the
+# DataTreeWidget's own minimumSizeHint: a compact path + metadata strip.
+sec_info = Collapsible(T('sec.info'))
 sec_info.add_widget(path_label)
 sec_info.add_widget(data_tree)
-vsplit.addWidget(sec_info)
+sec_info.setMinimumHeight(0)
+vsplit.insertWidget(0, sec_info)          # [info, tree, nano]
 
 # Native-unit -> SI factors for auto-filling measured points
 _Y_TO_SI = {
@@ -784,16 +1298,18 @@ _orig_vb_wheel = vb.wheelEvent
 
 
 def vb_wheel_event(ev, axis=None):
-    """Force dual-axis wheel zoom everywhere (axis strips included).
-
-    A burst of consecutive wheel events (< 0.5 s apart) is one undo step.
+    """Wheel zoom with per-axis routing (pyqtgraph native): over the plot
+    area axis=None -> dual-axis zoom; over an axis strip the AxisItem
+    forwards axis=0/1 -> ONLY that axis zooms. The undo history keeps
+    working: a burst of consecutive wheel events (< 0.5 s apart) is one
+    undo step.
     """
     global _last_wheel_push
     now = time.time()
     if now - _last_wheel_push > 0.5:
         zoom_history.append(tuple(tuple(r) for r in vb.viewRange()))
     _last_wheel_push = now
-    return _orig_vb_wheel(ev, axis=None)
+    return _orig_vb_wheel(ev, axis=axis)
 
 
 vb.wheelEvent = vb_wheel_event
@@ -840,18 +1356,22 @@ def vb_drag_event(ev, axis=None):
             amp_drag_update(lo, hi)
         return
     if (axis is None and ev.button() == pg.QtCore.Qt.LeftButton
-            and _evt_active()
+            and _grab_active()
             and (ev.modifiers() & pg.QtCore.Qt.ShiftModifier)):
-        # Events selection gesture: Shift + left-drag draws the Y-range band
-        # vertically (live preview; a vertical extent below 3% of the view
-        # height is treated as an accidental drag and ignored on release).
+        # Grab selection gesture: Shift + left-drag rubber-bands an XY
+        # rectangle -- one gesture gives BOTH the time scope (X) and the
+        # event band (Y) of a scoped detection, committed to the record
+        # list on release. Plain drag pans (or moves a rectangle the cursor
+        # started inside); axis-strip drag zooms -- never hijacked.
         ev.accept()
         p0 = vb.mapSceneToView(ev.buttonDownScenePos())
         p1 = vb.mapSceneToView(ev.scenePos())
+        x0, x1 = sorted((float(p0.x()), float(p1.x())))
+        y0, y1 = sorted((float(p0.y()), float(p1.y())))
         if ev.isFinish():
-            band_drag_finish(p0.y(), p1.y())
+            grab_drag_finish(x0, x1, y0, y1)
         else:
-            band_drag_update(p0.y(), p1.y())
+            grab_drag_update(x0, x1, y0, y1)
         return
     if axis is None or ev.button() != pg.QtCore.Qt.LeftButton:
         return _orig_vb_drag(ev, axis=axis)
@@ -895,25 +1415,149 @@ for _key in (pg.QtCore.Qt.Key_Delete, pg.QtCore.Qt.Key_Backspace):
     _sc.activated.connect(restore_view)
 
 
+_bundle_cache = {}       # abspath -> Bundle, LRU (multi-document tabs)
+
+
 def load(file_name):
-    """Load a new .dat file into the browser.
-    """
-    global bundle, tree_items
-    
-    # Read the bundle header
-    # (no data is read at this time)
-    bundle = heka_reader.Bundle(file_name)
-    
+    """Load a new .dat file into the browser. The parsed bundle is
+    LRU-cached (2 entries): switching document tabs between two files
+    reuses the parse instead of re-reading the .pul."""
+    global bundle, tree_items, _loaded_file, _loaded_fp
+
     file_name = os.path.abspath(file_name)
+    bundle = _bundle_cache.get(file_name)
+    if bundle is not None:
+        _bundle_cache.pop(file_name)
+        _bundle_cache[file_name] = bundle          # LRU touch
+    else:
+        # Read the bundle header (no data is read at this time)
+        bundle = heka_reader.Bundle(file_name)
+        _bundle_cache[file_name] = bundle
+        while len(_bundle_cache) > 2:
+            _bundle_cache.pop(next(iter(_bundle_cache)))
+    _loaded_file = file_name
+    _loaded_fp = _file_fp(file_name)
     settings.setValue('last_dir', os.path.dirname(file_name))
+    # the explorer column follows the loaded data (root = its directory;
+    # F5 / follow reload in place and never touch the root)
+    _exp_set_root(os.path.dirname(file_name))
     win.setWindowTitle(file_name)
     path_label.setText(file_name)
+    if follow_btn.isChecked():
+        _watch_switch(file_name)
     
     # Clear the tree and update to show the structure provided in the embedded
     # .pul file
     tree.clear()
     update_tree(tree.invisibleRootItem(), [])
     replot()
+
+
+# -- follow mode: near-live re-parse of a .dat Patchmaster is writing --------
+#   QFileSystemWatcher on the loaded file; Patchmaster appends in bursts, so
+#   changes are debounced 500 ms. A reload makes a FRESH Bundle (the old
+#   instance caches its lazily-parsed .pul tree), rebuilds the file tree and
+#   restores the selection by index path -- the view never jumps away from
+#   what the user is looking at. A half-written sweep makes the parse raise;
+#   that reload is skipped (silently while following) and the next file
+#   change retries. New sweeps change the trace-label set, so previously
+#   grabbed rows grey out (records stay) and the join axis grows.
+
+_watcher = pg.QtCore.QFileSystemWatcher()
+_follow_debounce = pg.QtCore.QTimer()
+_follow_debounce.setSingleShot(True)
+_follow_debounce.setInterval(500)
+
+
+def _tree_item_by_path(path):
+    """Tree item whose .index equals the given index path, or None.
+
+    The tree's ONLY top-level item is the file root ('Pulsed', index [])
+    -- all content hangs below it, so the descent starts at the root's
+    children. (Comparing against invisibleRoot's children never matched:
+    every real path starts with its G index, which silently broke the
+    follow-mode selection restore and the grab-CSV import lock-on.)"""
+    node = next((tree.topLevelItem(k)
+                 for k in range(tree.topLevelItemCount())
+                 if tuple(tree.topLevelItem(k).index) == ()), None)
+    if node is None:
+        return None
+    for depth in range(len(path)):
+        target = tuple(path[:depth + 1])
+        node = next((node.child(k) for k in range(node.childCount())
+                     if tuple(node.child(k).index) == target), None)
+        if node is None:
+            return None
+    return node
+
+
+def _reload_file(silent=False):
+    """Re-parse the loaded .dat in place. Returns True on success."""
+    global bundle, _loaded_fp
+    if not _loaded_file or not os.path.isfile(_loaded_file):
+        return False
+    sel_paths = [tuple(it.index) for it in tree.selectedItems()]
+    try:
+        new_bundle = heka_reader.Bundle(_loaded_file)
+        new_bundle.pul          # force the .pul parse NOW: a truncated
+        bundle = new_bundle     # tail must raise here, not on first click
+        _bundle_cache.pop(_loaded_file, None)     # on-disk change: evict
+        _bundle_cache[_loaded_file] = new_bundle
+        while len(_bundle_cache) > 2:
+            _bundle_cache.pop(next(iter(_bundle_cache)))
+        _file_fp_cache.pop(_loaded_file, None)    # content changed: rehash
+        _loaded_fp = _file_fp(_loaded_file)
+    except Exception:
+        if not silent:
+            pg.QtWidgets.QMessageBox.warning(
+                win, T('reload.title'), T('reload.fail'))
+        return False
+    tree.blockSignals(True)
+    tree.clear()
+    update_tree(tree.invisibleRootItem(), [])
+    for path in sel_paths:
+        item = _tree_item_by_path(path)
+        if item is not None:
+            item.setSelected(True)
+    tree.blockSignals(False)
+    replot()
+    return True
+
+
+def _watch_switch(path):
+    """Point the watcher at exactly one path."""
+    for p in list(_watcher.files()):
+        _watcher.removePath(p)
+    if path:
+        _watcher.addPath(path)
+
+
+def _follow_toggled(checked):
+    if checked:
+        if not _loaded_file:
+            follow_btn.setChecked(False)      # nothing to watch yet
+            return
+        _watch_switch(_loaded_file)
+    else:
+        _watch_switch('')                     # stop watching everything
+
+
+def _follow_changed(path):
+    if not follow_btn.isChecked() or path != _loaded_file:
+        return
+    # some writers replace the file (the watcher then drops the path) --
+    # re-add defensively and debounce the burst of changes
+    if path not in _watcher.files():
+        _watcher.addPath(path)
+    _follow_debounce.start()
+
+
+_follow_debounce.timeout.connect(lambda: _reload_file(silent=True))
+_watcher.fileChanged.connect(_follow_changed)
+follow_btn.toggled.connect(_follow_toggled)
+
+_sc_f5 = QShortcut(pg.QtGui.QKeySequence('F5'), win)
+_sc_f5.activated.connect(lambda: _reload_file())
     
 
 def update_tree(root_item, index):
@@ -968,7 +1612,7 @@ def trace_label(index):
     return label
 
 
-def build_stitched(entries):
+def build_joined(entries):
     """Concatenate cached (x, y, label, trace) entries end-to-end on a
     continuous time axis.
 
@@ -1004,9 +1648,9 @@ def replot():
     trace nodes plot individually. Multi-selection plots the union
     (deduplicated) of all expanded traces.
     """
-    global cur_xunit, cur_yunit, last_snap, stitch_segments, last_data
-    global _stitch_active, _stitch_cache, _prep_cache, _stitched_display
-    global _data_stamp, _band_cleared
+    global cur_xunit, cur_yunit, last_snap, join_segments, last_data
+    global last_data_idx, _join_active, _join_cache, _prep_cache
+    global _joined_display, _data_stamp
     plot.clear()
     legend.clear()
     data_tree.clear()
@@ -1015,20 +1659,19 @@ def replot():
     add_crosshair()
     add_zoom_regions()
     add_readout()
-    add_detect_items()
     zoom_history.clear()
-    stitch_segments = []
-    _stitch_active = False
-    _stitch_cache = None
+    join_segments = []
+    _join_active = False
+    _join_cache = None
     _prep_cache = None
-    _stitched_display = None
-    _band_cleared = False
+    _joined_display = None
     _data_stamp += 1
 
     selected = tree.selectedItems()
     if len(selected) < 1 or bundle is None:
         last_data = []
-        run_detection()
+        last_data_idx = []
+        add_grab_items()
         amp_recompute()
         return
 
@@ -1046,27 +1689,42 @@ def replot():
     # cache every displayed trace (raw arrays, one disk read each) for the
     # analysis panel; plotting below reuses the cache
     last_data = []
+    last_data_idx = []
     _data_stamp += 1
     for index, trace in items:
         data = bundle.data[list(index)]
         time = np.linspace(trace.XStart, trace.XStart + trace.XInterval * (len(data)-1), len(data))
         last_data.append((time, data, trace_label(index), trace))
+        last_data_idx.append(tuple(index))
 
     if len(items) > 20:
         legend.hide()
     else:
         legend.show()
 
-    if stitch_btn.isChecked() and len(items) > 1:
+    if join_btn.isChecked() and len(items) > 1:
         trace0 = items[0][1]
-        plot.setLabels(bottom=('Time', trace0.XUnit), left=(trace0.Label, trace0.YUnit))
+        plot.setLabels(bottom=('Time', trace0.XUnit), left=(trace.Label, trace0.YUnit))
         cur_xunit = trace0.XUnit
         cur_yunit = trace0.YUnit
-        x, y, seams, seg_infos = build_stitched(last_data)
-        stitch_segments = seg_infos
-        _stitch_active = True
-        _stitched_display = (x, y)
-        plot.plot(x, y, pen=pg.mkPen(THEME['cycle'][0], width=1), name='stitched ×%d' % len(items))
+        x, y, seams, seg_infos = build_joined(last_data)
+        join_segments = seg_infos
+        _join_active = True
+        _joined_display = (x, y)
+        # VISUAL-only large-data guard (the analysis paths -- _joined_display,
+        # amp_values, detection -- always read the full-resolution arrays):
+        # a 26-sweep join at 500k samples is a 13M-point curve, and pyqtgraph
+        # defaults (no downsampling, no clipping) rasterize the whole
+        # QPainterPath every paint -- ~2 s per pan frame, ~5 s first paint
+        # (measured offscreen, 2026-10; the 500mv-medium/low 'open is laggy'
+        # report). auto+peak ds scales with the view span (this is a LONG
+        # curve spanning the view -- the short-curve vanishing bug in
+        # AGENTS.md does not apply here; the green event curves keep their
+        # explicit auto=False override).
+        c = plot.plot(x, y, pen=pg.mkPen(THEME['cycle'][0], width=1),
+                      name='joined ×%d' % len(items))
+        c.setDownsampling(auto=True, method='peak')
+        c.setClipToView(True)
         for t in seams:
             line = pg.InfiniteLine(pos=t, angle=90, movable=False,
                                    pen=pg.mkPen(THEME['seam'], width=1, style=pg.QtCore.Qt.DashLine))
@@ -1076,48 +1734,85 @@ def replot():
             plot.setLabels(bottom=('Time', trace.XUnit), left=(trace.Label, trace.YUnit))
             cur_xunit = trace.XUnit
             cur_yunit = trace.YUnit
-            plot.plot(x, y, pen=trace_pen(i, len(items)), name=label)
+            c = plot.plot(x, y, pen=trace_pen(i, len(items)), name=label)
+            c.setDownsampling(auto=True, method='peak')
+            c.setClipToView(True)
 
+    # amp column unit follows the displayed data; set HERE (data time), not
+    # at analysis time, so committing the first region shifts nothing
+    amp_plot.setLabel('left', '', units=cur_yunit)
+
+    # rectangles re-attach ONLY against the NEW display: add_grab_items
+    # reads _grab_source_key(), which is built from last_data -- calling
+    # it before the rebuild made the PREVIOUS display's groups stick to
+    # the new plot (stale-key bug, found while writing CSV import)
+    add_grab_items()
     fit_view()
-    if _evt_active() and not _band_placed and not _band_cleared:
-        _place_band()
-    run_detection()
     amp_recompute()
+    _grab_after_replot()
 
 
 # replot when ever the user selects a new item
 tree.itemSelectionChanged.connect(replot)
 
 
-def stitch_toggled(checked):
-    settings.setValue('stitch', checked)
+def join_toggled(checked):
+    settings.setValue('join', checked)
     replot()
 
 
-stitch_btn.toggled.connect(stitch_toggled)
+join_btn.toggled.connect(join_toggled)
 
 
-# --- Distribution panel: amplitude histograms + threshold-band events --------
+# --- Distribution panel: amplitude histograms + scoped event grabs --------------
 #   Amp    checkable: left-drag in the plot adds time regions; the Amplitude
 #          tab shows the all-point histogram of the raw samples inside them.
-#   Detect checkable: a draggable horizontal band; what counts as an event
-#          is set by the mode (default: samples inside the band). The Events
-#          tab shows dwell / level histograms and highlights the events on
-#          the traces. Analysis always runs on the per-trace raw arrays in
-#          last_data (never on the stitched display curve) through the pure
-#          functions in heka/analysis.py.
+#   Grab   scoped detection: Shift+drag an XY rectangle (X = time scope,
+#          Y = the event band); every detected event becomes ONE row in the
+#          record list (the user's unit of analysis -- one curated event per
+#          row, dwell is the quantity of interest). Analysis always runs on
+#          the per-trace raw arrays in last_data (never on the joined
+#          display curve) through the pure functions in heka/analysis.py.
 
 last_data = []           # (x, y, label, trace) of every displayed trace
+last_data_idx = []       # tree index tuple per displayed trace (aligned)
 amp_regions = []         # committed time-region items
 _pending_region = None   # region currently being rubber-band dragged
 _evt_overlays = []       # event highlight curves in the main plot
-_stitch_active = False   # Stitch on -> detection runs on the continuous axis
-_stitch_cache = None     # (_data_stamp, head_s, smooth_ms, (x, y)) stitch axis
+_join_active = False   # Join on -> detection runs on the continuous axis
+_join_cache = None     # (_data_stamp, head_s, smooth_ms, (x, y)) join axis
 _prep_cache = None       # (_data_stamp, head_s, smooth_ms, [...]) per trace
-_stitched_display = None # raw stitched (x, y) shown in the main plot
+_joined_display = None # raw joined (x, y) shown in the main plot
 _data_stamp = 0          # bumped on every last_data rebind (cache keys)
-_band_placed = False     # Y-range band placed (auto or by the user)?
-_band_cleared = False    # [清空] pressed: stay silent until a new band is drawn
+_loaded_file = ''        # absolute path of the loaded .dat ('' = none)
+_loaded_fp = None        # intrinsic hash of the loaded .dat (see _file_fp)
+_FILE_FP_PREFIX = 4 * 1024 * 1024   # hashed prefix; append-stable for follow
+_file_fp_cache = {}      # abspath -> hash (or None when unreadable)
+
+
+def _file_fp(path):
+    """Intrinsic file identity: sha256 over the first 4 MiB (hex, 16
+    chars). Stable under move / rename / append (follow mode rewrites the
+    tail, never the prefix), so CSV row matching needs no path at all;
+    two acquisitions never share their noisy first megabytes in practice.
+    ~10 ms per file, cached per path. None when unreadable."""
+    if not path:
+        return None
+    p = os.path.abspath(path)
+    if p in _file_fp_cache:
+        return _file_fp_cache[p]
+    fp = None
+    try:
+        h = hashlib.sha256()
+        with open(p, 'rb') as fh:
+            h.update(fh.read(_FILE_FP_PREFIX))
+        fp = h.hexdigest()[:16]
+    except OSError:
+        fp = None
+    _file_fp_cache[p] = fp
+    return fp
+_grab_pending = None     # rubber-band ROI while Shift+dragging a grab rect
+_grab_syncing = False    # programmatic ROI moves: no recompute loops
 
 
 def _tint(hexcolor, alpha):
@@ -1131,7 +1826,7 @@ def analysis_segments(stride=1, head_s=0.0, smooth_ms=0.0):
 
     Default: one segment per displayed trace -- sweeps of one series share
     their time axis, so blind concatenation would fabricate events at the
-    junctions. With Stitch on, the traces are instead concatenated on their
+    junctions. With Join on, the traces are instead concatenated on their
     true acquisition timeline (each trace's first head_s seconds sliced off
     to drop the capacitor transient), so a level sojourn that outlives a
     single sweep is detected as ONE event instead of being cut at every
@@ -1143,15 +1838,15 @@ def analysis_segments(stride=1, head_s=0.0, smooth_ms=0.0):
     two-state traces can be analysed at all. The decimated time axis uses
     window centres; everything downstream (detection, dwell) lives on it.
     """
-    global _stitch_cache, _prep_cache
+    global _join_cache, _prep_cache
     prepped = _prepped(head_s, smooth_ms)
-    if _stitch_active and prepped:
-        if (_stitch_cache is None
-                or _stitch_cache[:3] != (_data_stamp, head_s, smooth_ms)):
+    if _join_active and prepped:
+        if (_join_cache is None
+                or _join_cache[:3] != (_data_stamp, head_s, smooth_ms)):
             xs, ys, t = [], [], None
             for x, y, label, trace, n_full in prepped:
                 # place each sweep on the same timeline as the displayed
-                # stitch: advance by the FULL sweep duration (head slicing
+                # join: advance by the FULL sweep duration (head slicing
                 # only hides samples, it must not compress the axis)
                 if t is None:
                     t = float(trace.XStart)
@@ -1159,9 +1854,9 @@ def analysis_segments(stride=1, head_s=0.0, smooth_ms=0.0):
                 xs.append(t + (x - float(trace.XStart)))
                 ys.append(y)
                 t += n_full * dt
-            _stitch_cache = (_data_stamp, head_s, smooth_ms,
+            _join_cache = (_data_stamp, head_s, smooth_ms,
                              (np.concatenate(xs), np.concatenate(ys)))
-        x, y = _stitch_cache[3]
+        x, y = _join_cache[3]
         if stride > 1:
             x, y = x[::stride], y[::stride]
         return [(x, y)]
@@ -1176,7 +1871,7 @@ def analysis_segments(stride=1, head_s=0.0, smooth_ms=0.0):
 def _prepped(head_s, smooth_ms):
     """Per-trace detection arrays: transient head sliced, optional median
     decimation applied; cached per (data version, head_s, smooth_ms).
-    n_full = the ORIGINAL sample count, so the stitch accumulation can
+    n_full = the ORIGINAL sample count, so the join accumulation can
     advance by full sweep durations while the arrays stay sliced."""
     global _prep_cache
     key = (_data_stamp, head_s, smooth_ms)
@@ -1203,21 +1898,13 @@ def total_points():
     return sum(len(y) for _, y, _, _ in last_data)
 
 
-# Detect band: two draggable lines + translucent fill; the region item is
-# re-attached by add_detect_items() after every plot.clear()
-band_region = pg.LinearRegionItem(values=(0.0, 1.0), orientation='horizontal',
-                                  movable=True, brush=_tint(THEME['band'], 60),
-                                  pen=pg.mkPen(THEME['band'], width=1))
-band_region.setZValue(-5)
-band_region.hide()
-
-
-def add_detect_items():
-    """Re-attach the Detect band to the plot (plot.clear() detaches it)."""
-    pi = plot.getPlotItem()
-    if band_region.scene() is None:
-        pi.addItem(band_region, ignoreBounds=True)
-    band_region.setVisible(_evt_active())
+def _tmin_decimation(t_min_ms, smooth_ms):
+    """最短 (ms) -> 检测序列点数；平滑压缩后检测序列变稀，再除以窗宽。
+    Used by the Grab tab's scoped detection."""
+    dt0 = float(last_data[0][3].XInterval) if last_data else 0.0
+    t_min_pts = max(1, int(round(t_min_ms * 1e-3 / dt0))) if dt0 > 0 else 1
+    w = max(1, int(round(smooth_ms * 1e-3 / dt0))) if (dt0 > 0 and smooth_ms > 0) else 1
+    return max(1, int(round(t_min_pts / w)))
 
 
 _amp_syncing = False
@@ -1283,55 +1970,112 @@ def clear_amp_regions():
     _refresh_region_list()
 
 
-# -- Distribution panel widgets -------------------------------------------------
+# -- Event panel + Amplitude column widgets --------------------------------------
+#   The old two-tab Analysis panel (Amplitude | Grab) is split: Amplitude
+#   lives in its own sideways-collapsible column right of the main plot,
+#   the Event panel (formerly Grab) occupies the bottom slot directly.
 
-sec_dist = Collapsible('Distribution')
-dist_tabs = pg.QtWidgets.QTabWidget()
-sec_dist.add_widget(dist_tabs)
+sec_dist = Collapsible(T('sec.dist'))
 dist_split.addWidget(sec_dist)
 
-# Amplitude tab: one histogram per region, Y axis linked to the main plot so
-# a histogram peak sits at the same height as its current level in the trace
+# Amplitude column: the histogram is ROTATED -- Y = the current axis,
+# X = % of samples -- and Y-linked to the main plot so a histogram peak
+# sits at the same height as its current level in the trace. Bars are
+# drawn in NATIVE units (pyqtgraph SI-prefixes the axis from the units=
+# label), which is what makes the link line up with the main plot's
+# native-unit view.
+amp_col = CollapsibleColumn(T('amp.title'))
 amp_tab = pg.QtWidgets.QWidget()
 amp_lay = pg.QtWidgets.QVBoxLayout(amp_tab)
 amp_lay.setContentsMargins(4, 4, 4, 4)
 amp_lay.setSpacing(3)
-amp_ctrl = pg.QtWidgets.QHBoxLayout()
-amp_clear_btn = pg.QtWidgets.QPushButton('清空区域')
-amp_ruler_btn = pg.QtWidgets.QPushButton('峰标尺')
+# activation hint at the TOP, mirroring the Event panel's hint row; the
+# bottom amp_stats keeps the per-region statistics only. Horizontal
+# size policy Ignored on the one-line text labels: a QLabel's minimum
+# width is its text width (~800 px for the zh hint!), which would pin
+# the whole column open and SHRINK it again the moment the hint empties
+# on the first committed region (the layout-min shift behind "it gets
+# narrower after analysing"). Ignored lets the column be any width; the
+# text clips when narrow and the tooltip carries the full wording.
+amp_hint = pg.QtWidgets.QLabel('')
+amp_hint.setSizePolicy(pg.QtWidgets.QSizePolicy.Ignored,
+                       pg.QtWidgets.QSizePolicy.Preferred)
+amp_hint.setStyleSheet('color:#999;')
+amp_lay.addWidget(amp_hint)
+# two control rows: the panel is narrow (15% of the window) and one row
+# of every control would set a ~460 px minimum width on the column
+amp_ctrl_a = pg.QtWidgets.QHBoxLayout()
+amp_ctrl_b = pg.QtWidgets.QHBoxLayout()
+amp_clear_btn = pg.QtWidgets.QPushButton(T('amp.clear'))
+amp_ruler_btn = pg.QtWidgets.QPushButton(T('amp.ruler'))
 amp_ruler_btn.setCheckable(True)
-amp_ruler_btn.setToolTip('在直方图上放置两条可拖动的竖线 A/B，\n'
-                         '实时读取两个峰的位置与它们的差 Δ')
-amp_auto_bins = pg.QtWidgets.QCheckBox('auto bins')
+amp_ruler_btn.setToolTip(T('amp.tip.ruler'))
+for _w in (amp_clear_btn, amp_ruler_btn):
+    amp_ctrl_a.addWidget(_w)
+amp_ctrl_a.addStretch(1)
+amp_auto_bins = pg.QtWidgets.QCheckBox(T('amp.autobins'))
 amp_auto_bins.setChecked(settings.value('amp/bins_auto', True, type=bool))
 amp_bins = NumericEdit(float(settings.value('amp/bins', 150.0, type=float)),
                        8, 4096, commit_on='finish')
-amp_follow = pg.QtWidgets.QCheckBox('range = view Y')
+amp_follow = pg.QtWidgets.QCheckBox(T('amp.follow'))
 amp_follow.setChecked(settings.value('amp/follow', False, type=bool))
-for _w in (amp_clear_btn, amp_ruler_btn, amp_auto_bins,
-           pg.QtWidgets.QLabel('bins'), amp_bins, amp_follow):
-    amp_ctrl.addWidget(_w)
-amp_ctrl.addStretch(1)
-amp_lay.addLayout(amp_ctrl)
+for _w in (amp_auto_bins, pg.QtWidgets.QLabel('bins'), amp_bins, amp_follow):
+    amp_ctrl_b.addWidget(_w)
+amp_ctrl_b.addStretch(1)
+amp_ctrl_rows = pg.QtWidgets.QVBoxLayout()
+amp_ctrl_rows.addLayout(amp_ctrl_a)
+amp_ctrl_rows.addLayout(amp_ctrl_b)
+amp_lay.addLayout(amp_ctrl_rows)
 amp_list_widget = pg.QtWidgets.QWidget()          # one row per committed region
 amp_list_lay = pg.QtWidgets.QVBoxLayout(amp_list_widget)
 amp_list_lay.setContentsMargins(0, 0, 0, 0)
 amp_list_lay.setSpacing(1)
 amp_lay.addWidget(amp_list_widget)
 amp_plot = pg.PlotWidget()
+# Reserve the left-axis width up front: tick numbers and the unit label
+# only appear once analysis fills the histogram, and their late arrival
+# used to visibly narrow the column on the first committed region (the
+# layout-shift the users reported as "it shrinks after analysing").
+amp_plot.getPlotItem().getAxis('left').setWidth(56)
+amp_plot.setLabels(bottom=T('amp.axisy'))
 amp_lay.addWidget(amp_plot, 1)
 amp_ruler_lbl = pg.QtWidgets.QLabel('')
+amp_ruler_lbl.setSizePolicy(pg.QtWidgets.QSizePolicy.Ignored,
+                            pg.QtWidgets.QSizePolicy.Preferred)
 amp_lay.addWidget(amp_ruler_lbl)
 amp_stats = pg.QtWidgets.QLabel('')
 amp_stats.setWordWrap(True)
 amp_lay.addWidget(amp_stats)
-dist_tabs.addTab(amp_tab, 'Amplitude')
+amp_col.body_lay.addWidget(amp_tab, 1)
+top_split.addWidget(amp_col)
+# stretch: the main plot absorbs all resizing, the amp column keeps
+# whatever width it was given (setSizes / drag / restore). Without this,
+# every layout pass redistributes surplus space per size hints and the
+# column springs back open -- the "too wide no matter what" effect.
+top_split.setStretchFactor(0, 1)
+top_split.setStretchFactor(1, 0)
 
-# Peak ruler: two draggable vertical markers on the amplitude histogram for
-# reading peak positions and their difference (dI between two states)
-ruler_a = pg.InfiniteLine(angle=90, movable=True,
+
+def _amp_follow_main_y(*_):
+    """Mirror the main plot's Y view onto the amplitude histogram.
+
+    Deliberately NOT ViewBox.setYLink: pyqtgraph's link is PIXEL-aligning
+    (linkedViewChanged maps units-per-pixel between the two views' screen
+    geometries) -- correct for overlaid plots, wrong for a side panel of a
+    different height, where it silently drifts the range (0.14实测:
+    [-200,50] -> [-185.5,50]). A manual mirror is exact and one-way.
+    """
+    avb = amp_plot.getPlotItem().getViewBox()
+    y0, y1 = vb.viewRange()[1]
+    avb.enableAutoRange(y=False)
+    avb.setYRange(y0, y1, padding=0)
+
+# Peak ruler: two draggable horizontal markers on the amplitude histogram
+# (values on the Y=current axis) for reading peak positions and their
+# difference (dI between two states)
+ruler_a = pg.InfiniteLine(angle=0, movable=True,
                           pen=pg.mkPen(THEME['A'], width=1))
-ruler_b = pg.InfiniteLine(angle=90, movable=True,
+ruler_b = pg.InfiniteLine(angle=0, movable=True,
                           pen=pg.mkPen(THEME['B'], width=1))
 for _r in (ruler_a, ruler_b):
     _r.hide()
@@ -1361,157 +2105,806 @@ def _update_ruler(*_):
 def amp_ruler_toggled(checked):
     _attach_ruler()
     if checked:
-        x0, x1 = amp_plot.getPlotItem().getViewBox().viewRange()[0]
-        if not x0 <= ruler_a.value() <= x1:
-            ruler_a.setValue(x0 + 0.3 * (x1 - x0))
-        if not x0 <= ruler_b.value() <= x1:
-            ruler_b.setValue(x0 + 0.7 * (x1 - x0))
+        y0, y1 = amp_plot.getPlotItem().getViewBox().viewRange()[1]
+        if not y0 <= ruler_a.value() <= y1:
+            ruler_a.setValue(y0 + 0.3 * (y1 - y0))
+        if not y0 <= ruler_b.value() <= y1:
+            ruler_b.setValue(y0 + 0.7 * (y1 - y0))
     _update_ruler()
 
-# Events tab: laid out in workflow order -- enable, Y range, edge rules,
-# then the headline result and the histograms
-evt_tab = pg.QtWidgets.QWidget()
-evt_lay = pg.QtWidgets.QVBoxLayout(evt_tab)
-evt_lay.setContentsMargins(4, 4, 4, 4)
-evt_lay.setSpacing(2)
+# Detailed per-parameter explanations for the Grab tab's edge rules; every
+# label AND its field carry the same tooltip (users hover the text, not the
+# box). Historically the Events tab's tooltips -- that tab is gone (one
+# curated event per Grab row replaced whole-data detection), the physics
+# stayed.
 
-evt_ctrl0 = pg.QtWidgets.QHBoxLayout()
-_evt_hint = pg.QtWidgets.QLabel('本页已激活：Shift+竖向拖拽画出 Y 范围带（普通拖拽 = 平移，'
-                                '轴条拖拽 = 缩放）；绿色 = 判定为事件的采样段；'
-                                '带子圈住事件电流水平，不要圈基线')
-_evt_hint.setStyleSheet('color:#999;')
-evt_ctrl0.addWidget(_evt_hint)
-evt_ctrl0.addStretch(1)
-evt_lay.addLayout(evt_ctrl0)
+# Event panel (formerly the Grab tab): scoped detection -- Shift+drag an XY
+# rectangle in the main plot (X = analysis time scope, Y = the event band),
+# detection runs inside it and the result is snapshotted into the record
+# list (right half). Detection parameters are this panel's own (snapshot at
+# grab/edit time; records keep the params they were made with).
+grab_tab = pg.QtWidgets.QWidget()
+grab_lay = pg.QtWidgets.QVBoxLayout(grab_tab)
+grab_lay.setContentsMargins(4, 4, 4, 4)
+grab_lay.setSpacing(2)
 
-evt_ctrl1 = pg.QtWidgets.QHBoxLayout()          # workflow step 1: the Y range
-evt_lo = NumericEdit(0.0, -1e6, 1e6, commit_on='finish')
-evt_hi = NumericEdit(1.0, -1e6, 1e6, commit_on='finish')
-evt_ylab = pg.QtWidgets.QLabel('(%s)' % cur_yunit)
-evt_lo.setToolTip('Y 范围下沿，单位自动取可读的 SI 前缀（如 pA），与图上带子双向同步')
-for _w in (pg.QtWidgets.QLabel('<b>Y 范围</b>  lo'), evt_lo,
-           pg.QtWidgets.QLabel('–  hi'), evt_hi, evt_ylab,
-           pg.QtWidgets.QLabel('<span style="color:#999">(与主图青色带双向同步，可直接输入)</span>')):
-    evt_ctrl1.addWidget(_w)
-evt_ctrl1.addStretch(1)
-evt_lay.addLayout(evt_ctrl1)
+grab_ctrl0 = pg.QtWidgets.QHBoxLayout()
+grab_hint = pg.QtWidgets.QLabel(T('grab.hint'))
+grab_hint.setStyleSheet('color:#999;')
+grab_hint.setToolTip(T('grab.tip.hint'))
+grab_ctrl0.addWidget(grab_hint)
+grab_ctrl0.addStretch(1)
+grab_lay.addLayout(grab_ctrl0)
 
-evt_ctrl2 = pg.QtWidgets.QHBoxLayout()          # workflow step 2: edge rules
-evt_mode = pg.QtWidgets.QComboBox()
-evt_mode.addItems(['inside', 'outside', 'below', 'above'])
-evt_mode.setCurrentText(settings.value('dist/mode', 'inside', type=str))
-evt_k = NumericEdit(float(settings.value('dist/k', 3.0, type=float)),
-                    0.0, 1e4, commit_on='finish')
-evt_tmin = NumericEdit(float(settings.value('dist/t_min_ms', 0.1, type=float)),
-                       0.0, 1e4, commit_on='finish')
-evt_merge = NumericEdit(float(settings.value('dist/merge', 0.0, type=float)),
+grab_ctrl = pg.QtWidgets.QHBoxLayout()           # this tab's own edge rules
+grab_mode = pg.QtWidgets.QComboBox()
+grab_mode.addItems(['inside', 'outside', 'below', 'above'])
+grab_mode.setCurrentText(settings.value('grab/mode', 'inside', type=str))
+grab_k = NumericEdit(float(settings.value('grab/k', 3.0, type=float)),
+                     0.0, 1e4, commit_on='finish')
+grab_tmin = NumericEdit(float(settings.value('grab/t_min_ms', 0.1, type=float)),
                         0.0, 1e4, commit_on='finish')
-evt_head = NumericEdit(float(settings.value('dist/head', 10.0, type=float)),
-                       0.0, 1e4, commit_on='finish')
-evt_smooth = NumericEdit(float(settings.value('dist/smooth', 0.0, type=float)),
+grab_merge = NumericEdit(float(settings.value('grab/merge', 0.0, type=float)),
                          0.0, 1e4, commit_on='finish')
-evt_duty = NumericEdit(float(settings.value('dist/duty', 0.5, type=float)),
-                       0.0, 1.0, commit_on='finish')
-evt_dwell_log = pg.QtWidgets.QCheckBox('对数X')
-evt_dwell_log.setChecked(settings.value('dist/dwell_log', False, type=bool))
-evt_dwell_log.setToolTip('dwell 直方图用对数 bin + 对数轴（默认线性）；\n'
-                         '1-CDF 视图恒为对数-对数')
-evt_ccdf = pg.QtWidgets.QCheckBox('1-CDF (log-log)')
-evt_ccdf.setChecked(settings.value('dist/ccdf', False, type=bool))
-
-# detailed per-parameter explanations; every label AND its field carry the
-# same tooltip (users hover the text, not the box)
-_EVT_TIP_MODE = ('事件语义——四种模式共用同一套滞回/时长逻辑：\n'
-                 'inside = 带内即事件（默认；不假定基线，带子圈住哪个电平，那段驻留就是事件）\n'
-                 'outside = 带外即事件（基线在带中，上下双向尖峰）\n'
-                 'below = y < hi 即事件（经典向下阻断，只用上边一条线）\n'
-                 'above = y > lo 即事件（向上尖峰）')
-_EVT_TIP_K = ('滞回 k·σ —— 事件结束的防抖门槛。\n'
-              '噪声会让信号在带沿反复进出；纯"进带=开始 / 出带=结束"会把一个真实\n'
-              '事件拆成大量碎片。滞回要求信号明确离开带宽 k 倍噪声 σ 才认定结束\n'
-              '（σ 由相邻采样差自动稳健估计，不受事件尖峰影响）。\n'
-              '默认 3 适合多数数据；噪声大或 spike 密可加到 5–8；0 = 完全关闭滞回')
-_EVT_TIP_TMIN = ('最短时长 —— 短于该时长的事件直接丢弃。\n'
-                 '滤掉电容毛刺与 spike 穿过带沿产生的 ~0.1–0.3 ms 碎片；\n'
-                 '两态驻留通常 ≥ 数 ms，所以 0.1–1 ms 很安全，只关心长驻留可加大到 10。\n'
-                 '内部按原始采样率换算成点数，开启平滑后自动再除以窗宽')
-_EVT_TIP_MERGE = ('合并 —— 相邻事件间隔小于该值时并成一个，把被 spike 短暂打断的\n'
-                  '真实驻留重新接上。\n'
-                  '⚠ 危险：spike 越密、碎片间隔越短，合并值过大会把整段信号串成一个\n'
-                  '巨型"假事件"（事件电平被带外间隙稀释）。spike 密集时保持 0，\n'
-                  '改用「检测平滑」压掉 spike +「带内占比」兜底')
-_EVT_TIP_HEAD = ('忽略开头 —— 每条 sweep 开头切掉这段时间，规避电容充放电瞬态\n'
-                 '（本数据瞬态可达 ±2 nA，不切会在每个 sweep 开头产生假事件）。\n'
-                 '10 ms 覆盖绝大多数情况；Stitch 模式下每条 sweep 的开头都会切')
-_EVT_TIP_SMOOTH = ('检测平滑 —— 检测前按窗宽做中位数压缩。\n'
-                   '比窗窄的 spike 被压平、比窗宽的电平台完整保留——spike 密集的\n'
-                   '两态数据的关键参数（建议 1–2 ms）。不开它时每个 spike 穿带都\n'
-                   '产生碎片；开了它 dwell/边界精度降为窗宽粒度（1 ms 窗 → 1 ms）。0 = 关闭')
-_EVT_TIP_DUTY = ('带内占比 —— 合并后事件跨度内真正在带内的时间占比，\n'
-                 '低于该值即丢弃：spike 顶部碎片链占比通常 ~3%，真实驻留 >50%，\n'
-                 '0.5 一刀分开。只对发生过合并的事件生效；0 = 关闭该过滤')
-_evt_params = [
-    ('模式', evt_mode, _EVT_TIP_MODE),
-    ('滞回 k·σ', evt_k, _EVT_TIP_K),
-    ('最短 (ms)', evt_tmin, _EVT_TIP_TMIN),
-    ('合并 (s)', evt_merge, _EVT_TIP_MERGE),
-    ('忽略开头 (ms)', evt_head, _EVT_TIP_HEAD),
-    ('检测平滑 (ms)', evt_smooth, _EVT_TIP_SMOOTH),
-    ('带内占比 ≥', evt_duty, _EVT_TIP_DUTY),
-    ('对数X', evt_dwell_log, evt_dwell_log.toolTip()),
-]
-evt_ctrl2.addWidget(pg.QtWidgets.QLabel('<b>边沿判定</b>'))
-for _name, _field, _tip in _evt_params:
+grab_head = NumericEdit(float(settings.value('grab/head', 10.0, type=float)),
+                        0.0, 1e4, commit_on='finish')
+grab_smooth = NumericEdit(float(settings.value('grab/smooth', 0.0, type=float)),
+                          0.0, 1e4, commit_on='finish')
+grab_duty = NumericEdit(float(settings.value('grab/duty', 0.5, type=float)),
+                        0.0, 1.0, commit_on='finish')
+for _name, _field, _tip in ((T('grab.p.mode'), grab_mode, 'evt.tip.mode'),
+                            (T('grab.p.k'), grab_k, 'evt.tip.k'),
+                            (T('grab.p.tmin'), grab_tmin, 'evt.tip.tmin'),
+                            (T('grab.p.merge'), grab_merge, 'evt.tip.merge'),
+                            (T('grab.p.head'), grab_head, 'evt.tip.head'),
+                            (T('grab.p.smooth'), grab_smooth, 'evt.tip.smooth'),
+                            (T('grab.p.duty'), grab_duty, 'evt.tip.duty')):
     _lab = pg.QtWidgets.QLabel(_name)
-    _lab.setToolTip(_tip)
-    _field.setToolTip(_tip)
-    evt_ctrl2.addWidget(_lab)
-    evt_ctrl2.addWidget(_field)
-evt_ccdf.setToolTip('dwell 直方图切换为存活函数 1−CDF（log-log），\n'
-                    '用于区分幂律与多指数驻留分布')
-evt_ctrl2.addWidget(evt_ccdf)
-evt_ctrl2.addStretch(1)
-evt_lay.addLayout(evt_ctrl2)
+    _lab.setToolTip(T(_tip))
+    _field.setToolTip(T(_tip))
+    grab_ctrl.addWidget(_lab)
+    grab_ctrl.addWidget(_field)
+grab_ctrl.addStretch(1)
+grab_lay.addLayout(grab_ctrl)
 
-evt_ctrl3 = pg.QtWidgets.QHBoxLayout()          # workflow step 3: the result
-evt_headline = pg.QtWidgets.QLabel('')
-evt_clear_btn = pg.QtWidgets.QPushButton('清空')
-evt_clear_btn.setToolTip('清除全部检测结果并隐藏带子；\n'
-                         '之后切走再切回本标签页也不会自动放带，\n'
-                         '直到重新画出（Shift+竖向拖拽或输入数值）新的范围')
-evt_table_btn = pg.QtWidgets.QPushButton('事件表')
-evt_csv_btn = pg.QtWidgets.QPushButton('导出 CSV')
-evt_ctrl3.addWidget(evt_headline)
-evt_ctrl3.addStretch(1)
-evt_ctrl3.addWidget(evt_clear_btn)
-evt_ctrl3.addWidget(evt_table_btn)
-evt_ctrl3.addWidget(evt_csv_btn)
-evt_lay.addLayout(evt_ctrl3)
+grab_split = pg.QtWidgets.QSplitter(pg.QtCore.Qt.Horizontal)
+grab_left = pg.QtWidgets.QWidget()
+grab_left_lay = pg.QtWidgets.QVBoxLayout(grab_left)
+grab_left_lay.setContentsMargins(0, 0, 0, 0)
+grab_left_lay.setSpacing(2)
+grab_plot = pg.PlotWidget()
+grab_left_lay.addWidget(grab_plot, 1)
+grab_stats = pg.QtWidgets.QLabel('')
+grab_left_lay.addWidget(grab_stats)
+grab_split.addWidget(grab_left)
 
-evt_split = pg.QtWidgets.QSplitter(pg.QtCore.Qt.Horizontal)
-dwell_plot = pg.PlotWidget()
-dwell_plot.getPlotItem().setLogMode(x=True)
-level_plot = pg.PlotWidget()
-evt_split.addWidget(dwell_plot)
-evt_split.addWidget(level_plot)
-evt_split.setStretchFactor(0, 1)
-evt_split.setStretchFactor(1, 1)
-evt_lay.addWidget(evt_split, 1)
+grab_right = pg.QtWidgets.QWidget()
+grab_right_lay = pg.QtWidgets.QVBoxLayout(grab_right)
+grab_right_lay.setContentsMargins(0, 0, 0, 0)
+grab_right_lay.setSpacing(2)
 
-# Measure lines: one draggable A/B pair on each Events histogram (always on
-# while the tab is active); the readout line reports both pairs + deltas
-dwell_ma = pg.InfiniteLine(angle=90, movable=True, pen=pg.mkPen(THEME['A'], width=1))
-dwell_mb = pg.InfiniteLine(angle=90, movable=True, pen=pg.mkPen(THEME['B'], width=1))
-level_ma = pg.InfiniteLine(angle=90, movable=True, pen=pg.mkPen(THEME['A'], width=1))
-level_mb = pg.InfiniteLine(angle=90, movable=True, pen=pg.mkPen(THEME['B'], width=1))
-evt_meas_lbl = pg.QtWidgets.QLabel('')
-evt_meas_lbl.setStyleSheet('color:#666;')
-evt_lay.addWidget(evt_meas_lbl)
 
-evt_stats = pg.QtWidgets.QLabel('')
-evt_stats.setWordWrap(True)
-evt_lay.addWidget(evt_stats)
-dist_tabs.addTab(evt_tab, 'Events')
+class _GrabDelDelegate(pg.QtWidgets.QStyledItemDelegate):
+    """Paints the per-row × delete affordance in column 5 and turns a
+    left-button release there into _grab_delete. NO per-row itemWidget
+    QPushButtons: ~1300 embedded widgets cost ~14.5 s per clear+rebuild
+    on a SHOWN Cocoa QTreeWidget (the 500mv-medium/low freeze, 2026-10;
+    plain-item rebuilds are ~2 ms -- and offscreen probes never see the
+    native-view cost, only a real-platform bench does). The click also
+    selects the row (the old real button consumed it); _grab_delete's
+    neighbour-fallback selection and its 250 ms double-click guard
+    already cover that."""
+
+    def paint(self, p, option, index):
+        hover = bool(option.state & pg.QtWidgets.QStyle.State_MouseOver)
+        p.save()
+        p.setPen(pg.QtGui.QPen(
+            pg.QtGui.QColor(THEME['accent'] if hover else '#9C9C9C')))
+        f = pg.QtGui.QFont(option.font)
+        f.setBold(hover)
+        p.setFont(f)
+        p.drawText(option.rect, pg.QtCore.Qt.AlignCenter, '×')
+        p.restore()
+
+    def editorEvent(self, ev, model, option, index):
+        if (ev.type() == pg.QtCore.QEvent.MouseButtonRelease
+                and ev.button() == pg.QtCore.Qt.LeftButton):
+            it = grab_tree.topLevelItem(index.row())   # flat list, no children
+            rid = getattr(it, 'rec_id', None)
+            if rid is not None:
+                _grab_delete(rid)
+                return True
+        return pg.QtWidgets.QStyledItemDelegate.editorEvent(
+            self, ev, model, option, index)
+
+
+grab_tree = pg.QtWidgets.QTreeWidget()
+grab_tree.setHeaderLabels(['#', 't_start', 'dwell', 'level',
+                           T('grab.col.noise'), ''])
+grab_tree.setRootIsDecorated(False)
+grab_tree.setSelectionBehavior(
+    pg.QtWidgets.QAbstractItemView.SelectRows)
+grab_tree.setEditTriggers(pg.QtWidgets.QAbstractItemView.NoEditTriggers)
+grab_tree.setUniformRowHeights(True)
+grab_tree.setItemDelegateForColumn(5, _GrabDelDelegate(grab_tree))
+# data columns stretch to fill the tree width; # and the x button stay
+# fixed -- the rows spread with the panel instead of huddling on the left
+_grab_hdr = grab_tree.header()
+_grab_hdr.setSectionResizeMode(0, pg.QtWidgets.QHeaderView.Fixed)
+for _c in (1, 2, 3, 4):
+    _grab_hdr.setSectionResizeMode(_c, pg.QtWidgets.QHeaderView.Stretch)
+_grab_hdr.setSectionResizeMode(5, pg.QtWidgets.QHeaderView.Fixed)
+_grab_hdr.setStretchLastSection(False)
+_grab_hdr.setSectionsClickable(True)
+grab_tree.setColumnWidth(0, 40)
+grab_tree.setColumnWidth(5, 26)
+grab_right_lay.addWidget(grab_tree, 1)
+grab_summary = pg.QtWidgets.QLabel('')   # running stats over ALL rows
+grab_summary.setStyleSheet('color:#666;')
+grab_right_lay.addWidget(grab_summary)
+grab_btns = pg.QtWidgets.QHBoxLayout()
+grab_viewall_btn = pg.QtWidgets.QPushButton(T('grab.viewall'))
+grab_viewall_btn.setCheckable(True)
+grab_viewall_btn.setToolTip(T('grab.tip.viewall'))
+grab_recalc_btn = pg.QtWidgets.QPushButton(T('grab.recalc'))
+grab_recalc_btn.setToolTip(T('grab.tip.recalc'))
+grab_clear_btn = pg.QtWidgets.QPushButton(T('grab.clear'))
+grab_btns.addStretch(1)
+for _b in (grab_viewall_btn, grab_recalc_btn, grab_clear_btn):
+    grab_btns.addWidget(_b)
+grab_right_lay.addLayout(grab_btns)
+grab_split.addWidget(grab_right)
+
+# File explorer column (MATLAB-style current folder), third pane of the
+# Grab tab: a plain QListWidget fed by QDir.entryInfoList and kept live by
+# a QFileSystemWatcher on the current directory. Deliberately NOT the
+# QFileSystemModel + QSortFilterProxyModel stack: dynamic proxy sorting
+# over the model's async fetcher thread segfaulted intermittently
+# (QTBUG-class race, unreproducible-friendly but 100% real offscreen),
+# and we only show a name column anyway. Our own sort: directories on
+# top, then a numeric-aware case-insensitive collator (a2.csv < a10.csv).
+exp_col = CollapsibleColumn(T('exp.title'))
+exp_tools = pg.QtWidgets.QHBoxLayout()
+exp_dir_lbl = pg.QtWidgets.QLabel('')
+exp_dir_lbl.setStyleSheet('color:#666;')
+exp_tools.addWidget(exp_dir_lbl, 1)
+exp_csv_only = pg.QtWidgets.QCheckBox(T('exp.csvonly'))
+exp_csv_only.setChecked(settings.value('explorer/csv_only', True, type=bool))
+exp_csv_only.setToolTip(T('exp.tip.csvonly'))
+exp_up = pg.QtWidgets.QPushButton('\u2191')
+exp_up.setFixedWidth(26)
+exp_up.setToolTip(T('exp.tip.up'))
+exp_refresh_btn = pg.QtWidgets.QPushButton('\u21bb')
+exp_refresh_btn.setFixedWidth(26)
+exp_refresh_btn.setToolTip(T('exp.tip.refresh'))
+for _w in (exp_csv_only, exp_up, exp_refresh_btn):
+    exp_tools.addWidget(_w)
+exp_col.body_lay.addLayout(exp_tools)
+exp_list = pg.QtWidgets.QListWidget()
+exp_list.setEditTriggers(pg.QtWidgets.QAbstractItemView.NoEditTriggers)
+exp_list.setSortingEnabled(False)        # the refresh owns the order
+exp_list.setToolTip(T('exp.tip.list'))
+exp_col.body_lay.addWidget(exp_list, 1)
+
+_exp_dir = ['']
+_exp_collator = pg.QtCore.QCollator()
+_exp_collator.setCaseSensitivity(pg.QtCore.Qt.CaseInsensitive)
+_exp_collator.setNumericMode(True)
+_exp_icons = pg.QtWidgets.QFileIconProvider()
+exp_watcher = pg.QtCore.QFileSystemWatcher()
+_exp_watch_debounce = pg.QtCore.QTimer()   # watcher events arrive in bursts
+_exp_watch_debounce.setSingleShot(True)
+_exp_watch_debounce.setInterval(200)
+
+
+def _exp_entries():
+    """Visible entries of the current dir: dirs first, then files (csv
+    filter applies to files only), both name-sorted by the collator."""
+    if not _exp_dir[0]:
+        return []
+    qdir = pg.QtCore.QDir(_exp_dir[0])
+    qdir.setFilter(pg.QtCore.QDir.Files | pg.QtCore.QDir.AllDirs
+                   | pg.QtCore.QDir.NoDotAndDotDot)
+    infos = qdir.entryInfoList()
+    dirs = [i for i in infos if i.isDir()]
+    files = [i for i in infos if not i.isDir()]
+    if exp_csv_only.isChecked():
+        files = [f for f in files
+                 if f.suffix().lower() == 'csv']
+    key = lambda fi: _exp_collator.sortKey(fi.fileName())
+    return (sorted(dirs, key=key) + sorted(files, key=key))
+
+
+def _exp_refresh():
+    """Rebuild the list; keep the selection on the same path if alive.
+    Runs under _exp_building: the per-item setData calls would otherwise
+    look like rename commits to _exp_item_changed."""
+    _exp_building[0] = True
+    try:
+        current = (exp_list.currentItem().data(pg.QtCore.Qt.UserRole)
+                   if exp_list.currentItem() else None)
+        exp_list.clear()
+        for fi in _exp_entries():
+            it = pg.QtWidgets.QListWidgetItem(_exp_icons.icon(fi),
+                                              fi.fileName())
+            it.setFlags(it.flags() | pg.QtCore.Qt.ItemIsEditable)
+            it.setData(pg.QtCore.Qt.UserRole, fi.absoluteFilePath())
+            exp_list.addItem(it)
+            if fi.absoluteFilePath() == current:
+                exp_list.setCurrentItem(it)
+    finally:
+        _exp_building[0] = False
+
+
+def _exp_watch_switch(path):
+    for p in list(exp_watcher.directories()):
+        exp_watcher.removePath(p)
+    if path:
+        exp_watcher.addPath(path)
+
+
+def _exp_set_root(path, save=True):
+    """Point the explorer column at a directory (persisted as startup
+    dir); the watcher follows so live updates keep flowing."""
+    path = os.path.abspath(path)
+    if not os.path.isdir(path):
+        return
+    _exp_dir[0] = path
+    exp_dir_lbl.setText(os.path.basename(path) or path)
+    exp_dir_lbl.setToolTip(path)
+    exp_up.setEnabled(os.path.dirname(path) != path)
+    _exp_watch_switch(path)
+    _exp_refresh()
+    if save:
+        settings.setValue('explorer/dir', path)
+
+
+def _exp_up():
+    parent = os.path.dirname(_exp_dir[0]) if _exp_dir[0] else ''
+    if parent and parent != _exp_dir[0]:
+        _exp_set_root(parent)
+
+
+def _exp_csv_toggled(checked):
+    settings.setValue('explorer/csv_only', checked)
+    _exp_refresh()
+
+
+def _exp_double_clicked(item):
+    path = item.data(pg.QtCore.Qt.UserRole)
+    if not path:
+        return
+    if os.path.isdir(path):
+        _exp_set_root(path)
+    elif os.path.splitext(path)[1].lower() == '.csv':
+        _open_doc(path)
+
+
+# -- inline rename: Return/F2 starts an editor on the selected entry ----
+#   Double-click keeps its open/enter meaning; editing only ever starts
+#   programmatically (editItem), so NoEditTriggers stays. The commit
+#   lands in _exp_item_changed (itemChanged), guarded against the
+#   refresh's own setData calls by _exp_building.
+_exp_building = [False]
+
+
+class _ExpKeyFilter(pg.QtCore.QObject):
+    """Return / Enter / F2 on the explorer list = rename the selected
+    file or directory (the standard F2 binding plus Return, as requested).
+    Consumed here so QListWidget's own Return handling (itemActivated)
+    never fires -- double-click remains the only opener."""
+
+    def eventFilter(self, obj, ev):
+        if (ev.type() == pg.QtCore.QEvent.KeyPress
+                and ev.key() in (pg.QtCore.Qt.Key_Return,
+                                 pg.QtCore.Qt.Key_Enter,
+                                 pg.QtCore.Qt.Key_F2)
+                and exp_list.currentItem() is not None
+                and exp_list.state()
+                != pg.QtWidgets.QAbstractItemView.EditingState):
+            exp_list.editItem(exp_list.currentItem())
+            return True
+        return pg.QtCore.QObject.eventFilter(self, obj, ev)
+
+
+def _exp_rename_fixups(old, new):
+    """Repoint everything that referenced the old path: open documents
+    (their tab label follows the new basename), and the loaded .dat
+    (window title, path bar, follow watcher, bundle-LRU cache key) --
+    saving after a rename must not silently resurrect the old file."""
+    global _loaded_file
+    for d in _doc_list:
+        if d.get('path') == old:
+            d['path'] = new
+            d.pop('name', None)             # the label follows the new file
+            if d is _doc:
+                _doc_sync_tab()
+            else:
+                doc_tabs.setTabText(_doc_list.index(d), _doc_tab_label(d))
+    if _loaded_file == old:
+        _loaded_file = new
+        win.setWindowTitle(new)
+        path_label.setText(new)
+        b = _bundle_cache.pop(old, None)
+        if b is not None:
+            _bundle_cache[new] = b
+        fp = _file_fp_cache.pop(old, None)
+        if fp is not None:
+            _file_fp_cache[new] = fp
+        if follow_btn.isChecked():
+            _watch_switch(new)
+
+
+def _exp_item_changed(item):
+    """Editor commit on an explorer row = rename the file/dir."""
+    if _exp_building[0]:
+        return
+    path = item.data(pg.QtCore.Qt.UserRole)
+    if not path or not os.path.exists(path):
+        _exp_refresh()                      # stale row: just rebuild
+        return
+    old = os.path.basename(path)
+    new = item.text().strip()
+    target = os.path.join(os.path.dirname(path), new)
+
+    def _revert():
+        _exp_building[0] = True
+        try:
+            item.setText(old)
+        finally:
+            _exp_building[0] = False
+
+    if new == old:
+        _revert()
+        return
+    if (not new) or new in ('.', '..') or '/' in new or os.sep in new:
+        pg.QtWidgets.QMessageBox.warning(
+            win, T('exp.rename.title'), T('exp.rename.badname'))
+        _revert()
+        return
+    if os.path.exists(target) and not os.path.samefile(path, target):
+        # samefile lets a case-only rename through on case-insensitive
+        # filesystems (target "exists" because it IS the same file)
+        pg.QtWidgets.QMessageBox.warning(
+            win, T('exp.rename.title'), T('exp.rename.exists', name=new))
+        _revert()
+        return
+    try:
+        os.rename(path, target)
+    except OSError as exc:
+        pg.QtWidgets.QMessageBox.warning(
+            win, T('exp.rename.title'), T('exp.rename.fail', err=exc))
+        _revert()
+        return
+    _exp_rename_fixups(path, target)
+    # make the refresh keep the selection on the renamed entry
+    _exp_building[0] = True
+    try:
+        item.setData(pg.QtCore.Qt.UserRole, target)
+    finally:
+        _exp_building[0] = False
+    _exp_refresh()
+
+
+exp_list.installEventFilter(_ExpKeyFilter())
+exp_watcher.directoryChanged.connect(
+    lambda *_: _exp_watch_debounce.start())
+_exp_watch_debounce.timeout.connect(lambda: _exp_refresh())
+exp_refresh_btn.clicked.connect(lambda *_: _exp_refresh())
+
+grab_split.setStretchFactor(0, 1)
+grab_split.setStretchFactor(1, 1)
+grab_lay.addWidget(grab_split, 1)
+
+# --- Document pages: empty state vs. open document -----------------------------
+#   The Event panel hosts ONE analysis document at a time (multi-tab arrives
+#   with Phase 3). No document -> a centred New button; document open ->
+#   closable tab + Save / Save As + the grab content. The file column stays
+#   visible in BOTH states: it is the open-a-document entry point.
+doc_pages = pg.QtWidgets.QStackedWidget()
+
+empty_page = pg.QtWidgets.QWidget()
+empty_lay = pg.QtWidgets.QVBoxLayout(empty_page)
+new_doc_btn = pg.QtWidgets.QPushButton(T('doc.new'))
+new_doc_btn.setMinimumHeight(56)
+empty_hint = pg.QtWidgets.QLabel(T('doc.empty.hint'))
+empty_hint.setStyleSheet('color:#999;')
+empty_hint.setAlignment(pg.QtCore.Qt.AlignCenter)
+empty_lay.addStretch(1)
+empty_lay.addWidget(new_doc_btn, 0, pg.QtCore.Qt.AlignCenter)
+empty_lay.addSpacing(10)
+empty_lay.addWidget(empty_hint, 0, pg.QtCore.Qt.AlignCenter)
+empty_lay.addStretch(1)
+doc_pages.addWidget(empty_page)
+
+doc_page = pg.QtWidgets.QWidget()
+doc_lay = pg.QtWidgets.QVBoxLayout(doc_page)
+doc_lay.setContentsMargins(0, 0, 0, 0)
+doc_lay.setSpacing(2)
+doc_bar = pg.QtWidgets.QHBoxLayout()
+doc_tabs = pg.QtWidgets.QTabBar()
+doc_tabs.setTabsClosable(True)
+doc_tabs.setExpanding(False)
+doc_new_btn = pg.QtWidgets.QPushButton(T('doc.newbtn'))
+doc_new_btn.setToolTip(T('doc.new'))
+doc_save_btn = pg.QtWidgets.QPushButton(T('doc.save'))
+doc_saveas_btn = pg.QtWidgets.QPushButton(T('doc.saveas'))
+doc_bar.addWidget(doc_tabs, 1)
+doc_bar.addWidget(doc_new_btn)
+doc_bar.addWidget(doc_save_btn)
+doc_bar.addWidget(doc_saveas_btn)
+doc_lay.addLayout(doc_bar)
+doc_lay.addWidget(grab_tab, 1)
+doc_pages.addWidget(doc_page)
+
+doc_split = pg.QtWidgets.QSplitter(pg.QtCore.Qt.Horizontal)
+doc_split.addWidget(doc_pages)
+doc_split.addWidget(exp_col)
+doc_split.setStretchFactor(0, 1)
+doc_split.setStretchFactor(1, 0)
+doc_pages.setCurrentIndex(0)          # app starts with no document open
+sec_dist.add_widget(doc_split)
+
+# Visible, grabbable splitter handles everywhere: the Fusion default is a
+# few same-colour pixels that nobody can find or drag. A quiet grey bar
+# that lights up (theme accent blue) on hover marks every divider.
+_SPLIT_ACCENT = '#4E79A7'
+_SPLITTER_QSS = (
+    'QSplitter::handle { background: #DCDCDC; border-radius: 2px; }'
+    'QSplitter::handle:horizontal { width: 5px; margin: 3px 1px; }'
+    'QSplitter::handle:vertical { height: 5px; margin: 1px 3px; }'
+    'QSplitter::handle:hover { background: %s; }'
+    'QSplitter::handle:pressed { background: %s; }'
+    % (_SPLIT_ACCENT, _SPLIT_ACCENT))
+for _sp in (hsplit, vsplit, top_split, dist_split, doc_split, grab_split):
+    _sp.setHandleWidth(9)
+    _sp.setStyleSheet(_SPLITTER_QSS)
+
+
+# -- Document lifecycle (multi-tab) -----------------------------------------
+#   Document = the flat event CSV itself (v5 = the v4 columns + a '#'
+#   params header). The event rows ARE the content; rectangles / view
+#   state live in the per-tab session slot only. Tabs coexist: New / Open
+#   ADD a tab (nothing is lost, so no confirmation) -- only CLOSING a
+#   dirty tab asks. The ACTIVE document's session state lives in the
+#   module globals (grab_records / _grab_groups / _grab_rects / selection
+#   / counters / params); switching tabs captures those into the outgoing
+#   doc's slot and restores the incoming one. The display context is
+#   never snapshotted -- it is re-derived from the rows (bootstrap).
+_DOC_CLOSED = {'open': False, 'path': None, 'dirty': False}
+_doc = _DOC_CLOSED          # the ACTIVE document (sentinel when none)
+_doc_list = []              # every open document; list index == tab index
+_doc_switching = [False]    # re-entrancy guard around currentChanged
+
+
+def _doc_tab_label(d):
+    name = (d.get('name') or (os.path.basename(d['path']) if d['path']
+                              else T('doc.untitled')))
+    return name + (' •' if d['dirty'] else '')
+
+
+def _doc_sync_tab():
+    if _doc is not _DOC_CLOSED:
+        i = _doc_list.index(_doc)
+        doc_tabs.setTabText(i, _doc_tab_label(_doc))
+        doc_tabs.setTabToolTip(i, _doc['path'] or _doc.get('name') or '')
+
+
+def _doc_touch():
+    """Any real change to the event rows marks the document dirty."""
+    if _doc is not _DOC_CLOSED and not _doc['dirty']:
+        _doc['dirty'] = True
+        _doc_sync_tab()
+
+
+def _doc_activate_tab(d):
+    """Append d's tab and make it current WITHOUT recursing through the
+    currentChanged handler (the caller drives the state swap itself)."""
+    _doc_switching[0] = True
+    try:
+        doc_tabs.addTab('')
+        doc_tabs.setCurrentIndex(doc_tabs.count() - 1)
+    finally:
+        _doc_switching[0] = False
+    _doc_sync_tab()
+    doc_pages.setCurrentIndex(1)
+
+
+def _grab_detach_rects():
+    """Take every rectangle off the main plot (they stay alive in their
+    doc slot; add_grab_items re-attaches the matching ones after the
+    next replot)."""
+    pi = plot.getPlotItem()
+    for roi in _grab_rects.values():
+        if roi.scene() is not None:
+            pi.removeItem(roi)
+
+
+def _doc_state_capture():
+    """Globals -> the active document's session slot. Rects are detached
+    from the plot; tree rows are rebuilt on restore."""
+    global grab_records, _grab_groups, _grab_rects
+    global _grab_selected, _grab_focus_gid
+    if _doc is _DOC_CLOSED:
+        return
+    _grab_detach_rects()
+    _doc['state'] = dict(
+        records=grab_records, groups=_grab_groups, rects=_grab_rects,
+        selected=_grab_selected, focus=_grab_focus_gid,
+        next_eid=_grab_next_eid[0], next_gid=_grab_next_gid[0],
+        params=_grab_params())
+    grab_records = []
+    _grab_groups = {}
+    _grab_rects = {}
+    _grab_selected = None
+    _grab_focus_gid = None
+    _grab_items.clear()
+
+
+def _doc_state_restore():
+    """The active document's session slot -> globals (+ param widgets)."""
+    global grab_records, _grab_groups, _grab_rects
+    global _grab_selected, _grab_focus_gid
+    st = _doc.get('state') or {}
+    grab_records = st.get('records') or []
+    _grab_groups = st.get('groups') or {}
+    _grab_rects = st.get('rects') or {}
+    _grab_selected = st.get('selected')
+    _grab_focus_gid = st.get('focus')
+    _grab_next_eid[0] = st.get('next_eid', 1)
+    _grab_next_gid[0] = st.get('next_gid', 1)
+    _grab_items.clear()
+    p = dict(st.get('params') or {})
+    if p:
+        p.setdefault('head', p.get('head_ms'))
+        p.setdefault('smooth', p.get('smooth_ms'))
+        _apply_doc_params(p)
+    _refresh_grab_list()
+    _grab_show_selected()
+    _grab_show_overlays()
+
+
+def _doc_switch(idx):
+    """Activate another tab: capture the outgoing session into its slot,
+    restore the incoming one, re-derive the display context from rows."""
+    global _doc
+    if _doc_switching[0] or not (0 <= idx < len(_doc_list)):
+        return
+    if _doc is _doc_list[idx]:
+        return
+    _doc_switching[0] = True
+    try:
+        _doc_state_capture()
+        _doc = _doc_list[idx]
+        doc_tabs.setCurrentIndex(idx)
+        _doc_state_restore()
+        _doc_restore_context()
+        _doc_sync_tab()
+        doc_pages.setCurrentIndex(1)
+    finally:
+        _doc_switching[0] = False
+
+
+def _doc_open_untitled():
+    """Birth a new untitled document in its own tab. No confirmation:
+    the existing documents stay open in theirs."""
+    global _doc
+    _doc_state_capture()
+    n = sum(1 for d in _doc_list if d['path'] is None) + 1
+    d = {'open': True, 'path': None, 'dirty': False, 'state': {},
+         'name': (T('doc.untitled') if n == 1
+                  else '%s %d' % (T('doc.untitled'), n))}
+    _doc_list.append(d)
+    _doc = d
+    _doc_activate_tab(d)
+    # Empty slot -> globals + PANEL repaint. Without this the tree /
+    # summary / detail view / green overlays kept showing the OUTGOING
+    # document's rows (the model was already empty -- a display lie that
+    # survived until some later action happened to call
+    # _refresh_grab_list; the zero-event and >500 grab paths never do).
+    _doc_state_restore()
+
+
+def _reset_grab_globals():
+    """Drop ALL active grab state (rows / groups / rects / selection)
+    without touching the document bookkeeping."""
+    global grab_records, _grab_groups, _grab_rects
+    global _grab_selected, _grab_focus_gid
+    _grab_detach_rects()
+    grab_records = []
+    _grab_groups = {}
+    _grab_rects = {}
+    _grab_selected = None
+    _grab_focus_gid = None
+    _grab_items.clear()
+    _refresh_grab_list()
+
+
+def _doc_close_now():
+    """Close the ACTIVE document unconditionally (any confirmation has
+    already happened); a neighbour tab activates, or the panel returns
+    to the empty state."""
+    global _doc
+    if _doc is _DOC_CLOSED:
+        doc_pages.setCurrentIndex(0)
+        return
+    i = _doc_list.index(_doc)
+    _reset_grab_globals()
+    _doc_list.pop(i)
+    _doc = _DOC_CLOSED
+    _doc_switching[0] = True
+    try:
+        doc_tabs.removeTab(i)
+    finally:
+        _doc_switching[0] = False
+    if _doc_list:
+        _doc_switch(min(i, len(_doc_list) - 1))
+    else:
+        doc_pages.setCurrentIndex(0)
+
+
+def _doc_close_requested():
+    """Close the ACTIVE tab via its x: ask when dirty. Returns True when
+    the document ended up closed (or none was open)."""
+    if _doc is _DOC_CLOSED:
+        doc_pages.setCurrentIndex(0)
+        return True
+    if _doc['dirty']:
+        ans = pg.QtWidgets.QMessageBox.question(
+            win, T('doc.close.title'), T('doc.close.q', name=_doc_tab_label(_doc)),
+            pg.QtWidgets.QMessageBox.Save | pg.QtWidgets.QMessageBox.Discard
+            | pg.QtWidgets.QMessageBox.Cancel,
+            pg.QtWidgets.QMessageBox.Save)
+        if ans == pg.QtWidgets.QMessageBox.Save:
+            if not _doc_save():
+                return False          # save-as dialog cancelled: stay open
+            _doc_close_now()
+            return True
+        if ans == pg.QtWidgets.QMessageBox.Discard:
+            _doc_close_now()
+            return True
+        return False
+    _doc_close_now()
+    return True
+
+
+def _doc_close_tab(i):
+    """Close tab i. A dirty BACKGROUND tab is switched to first so the
+    standard confirmation applies; clean background tabs just vanish."""
+    if not (0 <= i < len(_doc_list)):
+        return True
+    d = _doc_list[i]
+    if d is not _doc:
+        if not d['dirty']:
+            _doc_switching[0] = True
+            try:
+                doc_tabs.removeTab(i)     # currentChanged -> guarded off
+            finally:
+                _doc_switching[0] = False
+            _doc_list.pop(i)
+            return True
+        _doc_switch(i)
+        if _doc is not d:
+            return False
+    return _doc_close_requested()
+
+
+def _doc_new():
+    """New analysis file: ADDS a tab. Existing documents stay open in
+    theirs -- nothing to confirm."""
+    _doc_open_untitled()
+
+
+def _write_grab_csv(path):
+    """Write the ACTIVE document to disk: v6 header (params included) +
+    the flat event table (v5 + file_hash). Returns success; marks it
+    clean on success."""
+    if not grab_records:
+        ans = pg.QtWidgets.QMessageBox.question(
+            win, T('csv.exp.title'), T('doc.empty.save'),
+            pg.QtWidgets.QMessageBox.Yes | pg.QtWidgets.QMessageBox.No,
+            pg.QtWidgets.QMessageBox.No)
+        if ans != pg.QtWidgets.QMessageBox.Yes:
+            return False
+    p = _grab_params()
+    try:
+        with open(path, 'w', newline='') as fh:
+            fh.write('# heka-browser grab export v6 (flat events; detection'
+                     ' params in header; file_hash = intrinsic .dat identity'
+                     ' -- matching is path-independent; groups are a GUI'
+                     ' selection tool and are not stored)\n'
+                     '# units: t=s, y=native (per-row trace_yunit)\n'
+                     '# join=True: t_* on the joined continuous axis;'
+                     ' False: native per-sweep axis\n'
+                     '# params: mode=%s k=%g t_min_ms=%g merge=%g head=%g'
+                     ' smooth=%g duty=%g\n'
+                     % (p['mode'], p['k'], p['t_min_ms'], p['merge'],
+                        p['head_ms'], p['smooth_ms'], p['duty']))
+            w = csv.writer(fh)
+            w.writerow(_GRAB_CSV_COLUMNS)
+            for rank, rec in enumerate(_grab_sorted_records(), 1):
+                ref = rec.get('trace_ref')
+                grp = _grab_groups.get(rec['gid']) \
+                    if rec['gid'] is not None else None
+                join = (grp['source_key'][1] if grp is not None
+                        else bool(rec.get('join', False)))
+                src_file = (grp['source_key'][0] if grp is not None
+                            else rec.get('source_file', ''))
+                # provenance was captured at grab time for grouped rows
+                # (the loaded file may since have changed); groupless
+                # rows carry their own
+                sz, mt, fp = (
+                    (grp.get('file_size', ''), grp.get('file_mtime', ''),
+                     grp.get('file_fp') or '')
+                    if grp is not None
+                    else (rec.get('file_size', ''),
+                          rec.get('file_mtime', ''),
+                          rec.get('file_hash') or ''))
+                w.writerow(
+                    [rank, rec['t_start'], rec['t_end'], rec['dwell'],
+                     rec['y_level'], rec['sigma'], join, src_file]
+                    + (list(ref) if ref is not None
+                       else ['', '', '', '', '', '', ''])
+                    + [sz, fp, mt])
+    except OSError as exc:
+        pg.QtWidgets.QMessageBox.warning(
+            win, T('csv.exp.title'), T('doc.savefail', err=exc))
+        return False
+    _doc['dirty'] = False
+    _doc_sync_tab()
+    return True
+
+
+def _doc_save():
+    if _doc is _DOC_CLOSED:
+        return False
+    if _doc['path'] is None:
+        return _doc_saveas()
+    return _write_grab_csv(_doc['path'])
+
+
+def _doc_saveas():
+    if _doc is _DOC_CLOSED:
+        return False
+    default = 'grab_events.csv'
+    if _loaded_file:
+        default = (os.path.splitext(os.path.basename(_loaded_file))[0]
+                   + '_events.csv')
+    start = os.path.join(_exp_dir[0] or settings.value('last_dir', ''),
+                         default)
+    path, _ = pg.QtWidgets.QFileDialog.getSaveFileName(
+        win, T('csv.exp.title'), start, 'CSV (*.csv)')
+    if not path:
+        return False
+    if not path.lower().endswith('.csv'):
+        path += '.csv'
+    if _write_grab_csv(path):
+        _doc['path'] = path
+        _doc.pop('name', None)
+        _doc_sync_tab()
+        return True
+    return False
+
+
+class _CloseGuard(pg.QtCore.QObject):
+    """Window close with ANY dirty document: walk the dirty tabs (switch
+    to each, ask Save/Discard/Cancel). Only a Cancel blocks the quit."""
+
+    def eventFilter(self, obj, ev):
+        if ev.type() == pg.QtCore.QEvent.Close:
+            if any(d['dirty'] for d in _doc_list):
+                ev.ignore()
+                for i in [k for k, d in enumerate(_doc_list)
+                          if d['dirty']]:
+                    _doc_switch(i)
+                    if not _doc_close_requested():
+                        return True            # cancelled: keep running
+                win.close()       # all clean/closed now: second pass
+                return True
+        return pg.QtCore.QObject.eventFilter(self, obj, ev)
+
+
+win.installEventFilter(_CloseGuard())
 
 
 # -- Analysis pipeline ------------------------------------------------------------
@@ -1519,11 +2912,11 @@ dist_tabs.addTab(evt_tab, 'Events')
 def amp_values(r0, r1, stride):
     """Raw samples of the displayed data inside a time region.
 
-    With Stitch on the regions live on the continuous stitched axis, so the
-    values come from the cached stitched raw arrays; otherwise per trace.
+    With Join on the regions live on the continuous joined axis, so the
+    values come from the cached joined raw arrays; otherwise per trace.
     """
-    if _stitch_active and _stitched_display is not None:
-        x, y = _stitched_display
+    if _join_active and _joined_display is not None:
+        x, y = _joined_display
         v = y[(x >= r0) & (x <= r1)]
         if stride > 1:
             v = v[::stride]
@@ -1549,16 +2942,16 @@ def amp_recompute(full=True):
     pi.clear()
     _attach_ruler()
     if not (_amp_active() and amp_regions):
-        amp_stats.setText('<span style="color:#999">本页已激活：按住 <b>Shift</b> 在主图'
-                          '内<b>横向拖拽</b>框选时间区域（普通拖拽 = 平移，轴条拖拽 = 缩放）；'
-                          '切到其他标签页会清除全部区域。</span>')
+        amp_stats.setText('')
+        _refresh_mode_hints()
         return
+    _refresh_mode_hints()
     stride = 1 if full else max(1, total_points() // 200000)
     regs = [r.getRegion() for r in amp_regions]
     per_region = [amp_values(r0, r1, stride) for r0, r1 in regs]
     pooled = [v for vals in per_region for v in vals]
     if not pooled:
-        amp_stats.setText('regions cover no samples')
+        amp_stats.setText(T('amp.nosamples'))
         return
     pooled = np.concatenate(pooled)
     if amp_follow.isChecked():
@@ -1570,8 +2963,6 @@ def amp_recompute(full=True):
 
     lines = []
     maxc = 0.0
-    f, prefix = _yunit_scale()
-    unit_s = '%s%s' % (prefix, cur_yunit)
     for k, ((r0, r1), vals) in enumerate(zip(regs, per_region)):
         if not vals:
             continue
@@ -1581,10 +2972,11 @@ def amp_recompute(full=True):
         frac = counts * 100.0 / max(1, v.size)
         maxc = max(maxc, float(frac.max()))
         color = THEME['cycle'][k % len(THEME['cycle'])]
-        # vertical histogram: X = current (display unit), Y = % of samples
+        # horizontal histogram: Y = current (NATIVE units -- the axis is
+        # Y-linked to the main plot, which is also native), X = % of samples
         pi.addItem(pg.BarGraphItem(
-            x0=edges[:-1] / f, x1=edges[1:] / f,
-            y0=np.zeros(len(frac)), y1=frac,
+            x0=np.zeros(len(frac)), x1=frac,
+            y0=edges[:-1], y1=edges[1:],
             brush=_tint(color, 150), pen=pg.mkPen(color, width=1)))
         p1, p99 = np.percentile(v, [1, 99])
         lines.append(
@@ -1593,10 +2985,14 @@ def amp_recompute(full=True):
             % (color, k, v.size, fmt_si(float(v.mean()), cur_yunit),
                fmt_si(float(v.std()), cur_yunit), fmt_si(float(p1), cur_yunit),
                fmt_si(float(p99), cur_yunit), under + over))
-    amp_plot.setLabels(bottom=unit_s, left='% of region samples')
+    # Y view mirrors the main plot manually (_amp_follow_main_y -- see the
+    # comment there for why not setYLink); only X (% of samples) is set
+    # here. The left axis / bottom label are configured at construction
+    # and in replot() -- never here, or the column layout would shift the
+    # moment the first histogram lands (fixedWidth reserves the ticks).
     if maxc > 0:
-        pi.getViewBox().setYRange(0, maxc * 1.1, padding=0)
-    pi.getViewBox().setXRange(edges[0] / f, edges[-1] / f, padding=0)
+        pi.getViewBox().setXRange(0, maxc * 1.1, padding=0)
+    _amp_follow_main_y()
     amp_stats.setText('<br>'.join(lines))
     _update_ruler()
 
@@ -1605,291 +3001,100 @@ def amp_preview():
     amp_recompute(full=False)
 
 
-def _attach_evt_meas():
-    """(Re-)attach the measure line pairs after a histogram rebuild and
-    give unset lines a sensible start position inside the view."""
-    for pi, (ma, mb) in ((dwell_plot.getPlotItem(), (dwell_ma, dwell_mb)),
-                         (level_plot.getPlotItem(), (level_ma, level_mb))):
-        for ln in (ma, mb):
-            if ln.scene() is None:
-                pi.addItem(ln, ignoreBounds=True)
-        x0, x1 = pi.getViewBox().viewRange()[0]
-        if not x0 <= ma.value() <= x1:
-            ma.setValue(x0 + 0.3 * (x1 - x0))
-        if not x0 <= mb.value() <= x1:
-            mb.setValue(x0 + 0.7 * (x1 - x0))
-
-
-def _update_evt_meas(*_):
-    if not _evt_active():
-        evt_meas_lbl.setText('')
-        return
-    f, prefix = _yunit_scale()
-    unit_s = '%s%s' % (prefix, cur_yunit)
-
-    def _pair(va, vb_, unit):
-        return 'A=%s B=%s Δ=%s' % (fmt_si(va, unit), fmt_si(vb_, unit),
-                                   fmt_si(abs(vb_ - va), unit))
-
-    # the measure lines live in DISPLAY units: scale back to the native axis
-    # before formatting so siFormat picks the prefix exactly once
-    lvl = lambda v: fmt_si(v * f, cur_yunit)
-    lvl_txt = 'A=%s B=%s Δ=%s' % (lvl(level_ma.value()), lvl(level_mb.value()),
-                                  lvl(abs(level_mb.value() - level_ma.value())))
-    evt_meas_lbl.setText('dwell: %s &nbsp;│&nbsp; level: %s'
-                         % (_pair(dwell_ma.value(), dwell_mb.value(), 's'),
-                            lvl_txt))
-
-
-def update_event_hists(events):
-    """Redraw the Events histograms: dwell (linear by default, log optional,
-    or 1-CDF) and the absolute event-level histogram, in display units."""
-    dwell_pi = dwell_plot.getPlotItem()
-    level_pi = level_plot.getPlotItem()
-    dwell_pi.clear()
-    level_pi.clear()
-    if not len(events):
-        _attach_evt_meas()
-        _update_evt_meas()
-        return
-    f, prefix = _yunit_scale()
-    unit_s = '%s%s' % (prefix, cur_yunit)
-    if evt_ccdf.isChecked():
-        sv = analysis.survival_function(events['dwell'])
-        if sv is not None:
-            dwell_pi.setLogMode(x=True, y=True)
-            dwell_pi.addItem(pg.PlotCurveItem(
-                sv[0], sv[1], pen=pg.mkPen(THEME['event'], width=2)))
-            dwell_plot.setLabels(bottom='dwell (s, log-log)', left='S(t) = 1-CDF')
-    elif evt_dwell_log.isChecked():
-        dwell_pi.setLogMode(x=True, y=False)
-        hist = analysis.log_histogram(events['dwell'])
-        if hist is not None:
-            edges, counts = hist
-            # stepMode='center' takes the bin EDGES (len = N+1) and draws
-            # each bar centred on its bin
-            dwell_pi.addItem(pg.PlotCurveItem(
-                edges, counts, stepMode='center',
-                pen=pg.mkPen(THEME['event'], width=1),
-                fillLevel=0, brush=_tint(THEME['event'], 120)))
-            dwell_plot.setLabels(bottom='dwell (s, log bins)', left='events')
-    else:
-        dwell_pi.setLogMode(x=False, y=False)
-        hist = analysis.all_point_histogram(events['dwell'])
-        if hist is not None:
-            edges, counts, under, over = hist
-            dwell_pi.addItem(pg.PlotCurveItem(
-                edges, counts, stepMode='center',
-                pen=pg.mkPen(THEME['event'], width=1),
-                fillLevel=0, brush=_tint(THEME['event'], 120)))
-            dwell_plot.setLabels(bottom='dwell (s)', left='events')
-    hist = analysis.all_point_histogram(events['y_level'])
-    if hist is not None:
-        edges, counts, under, over = hist
-        level_pi.addItem(pg.BarGraphItem(
-            x0=edges[:-1] / f, x1=edges[1:] / f,
-            y0=np.zeros(len(counts)), y1=counts,
-            brush=_tint(THEME['event'], 140), pen=pg.mkPen(THEME['event'], width=1)))
-        level_plot.setLabels(bottom='level (%s)' % unit_s, left='events')
-    _attach_evt_meas()
-    _update_evt_meas()
-
-
-def run_detection(full=True):
-    """Threshold-band event detection: overlay on the traces + Events tab.
-
-    full=False runs on a strided subsample (live band drags); release
-    recomputes in full. Raises of heka.analysis (bad band vs hysteresis)
-    land in the stats label instead of a dialog.
-    """
-    global _evt_overlays, _last_events, _last_labels
-    f, prefix = _yunit_scale()
-    evt_ylab.setText('(%s%s)' % (prefix, cur_yunit))
-    pi = plot.getPlotItem()
-    for it in _evt_overlays:
-        if it.scene() is not None:
-            pi.removeItem(it)
-    _evt_overlays = []
-    if not _evt_active() or not last_data or not _band_placed:
-        band_region.hide()
-        dwell_plot.getPlotItem().clear()
-        level_plot.getPlotItem().clear()
-        _last_events = None
-        if _band_cleared:
-            evt_headline.setText('<b>已清空</b>')
-            evt_stats.setText('<span style="color:#999">已清空：按住 Shift 在主图内'
-                              '<b>竖向拖拽</b>画出新的 Y 范围带后重新检测；切到其他标签页'
-                              '再切回也不会自动放带。</span>')
-        else:
-            evt_headline.setText('<b>0 个事件</b>')
-            evt_stats.setText('<span style="color:#999">切到本标签页即启用检测：按住 Shift '
-                              '在主图内<b>竖向拖拽</b>画出 Y 范围带（或拖带子边线、输入数值），'
-                              '信号进入带内=事件开始、离开带=事件结束；切走后自动停止。</span>')
-        return
-    band_region.show()
-    lo, hi = band_region.getRegion()
-    head_s = evt_head.value() * 1e-3
-    smooth_ms = evt_smooth.value()
-    # 最短 (ms) -> 原始采样点数；平滑压缩后检测序列变稀，再除以窗宽
-    dt0 = float(last_data[0][3].XInterval) if last_data else 0.0
-    t_min_pts = max(1, int(round(evt_tmin.value() * 1e-3 / dt0))) if dt0 > 0 else 1
-    w = max(1, int(round(smooth_ms * 1e-3 / dt0))) if (dt0 > 0 and smooth_ms > 0) else 1
-    t_min_dec = max(1, int(round(t_min_pts / w)))
-    total = total_points()
-    stride = 1 if full else max(1, total // 200000)
-    segs = analysis_segments(stride, head_s=head_s, smooth_ms=smooth_ms)
-    # the overlay is a visual indicator only: cap it to ~2M points so a
-    # whole-Group view (tens of millions of samples) stays fluid. Detection
-    # and all statistics below always run on the full-resolution segs.
-    if stride == 1 and total > 2000000:
-        osegs = analysis_segments(max(1, total // 2000000), head_s=head_s,
-                                  smooth_ms=smooth_ms)
-    else:
-        osegs = segs
-    try:
-        res = analysis.detect_events_segments(
-            segs, mode=evt_mode.currentText(), lo=lo, hi=hi, h=None,
-            k=evt_k.value(), t_min=t_min_dec,
-            merge_gap=evt_merge.value(), duty_min=evt_duty.value())
-    except ValueError as exc:
-        dwell_plot.getPlotItem().clear()
-        level_plot.getPlotItem().clear()
-        _last_events = None
-        evt_headline.setText('<b>0 个事件</b>')
-        evt_stats.setText('<span style="color:%s">%s</span>' % (THEME['A'], exc))
-        return
-    events = res.events
-    _last_events = events
-    _last_labels = [label for _, _, label, _ in last_data]
-
-    # highlight the event stretches on the displayed traces (NaN outside
-    # events + connect='finite' breaks the line there)
-    for k, (x, y) in enumerate(osegs):
-        ev = events[events['i_seg'] == k]
-        if not len(ev):
-            continue
-        mask = np.zeros(len(x), dtype=bool)
-        lo_i = np.searchsorted(x, ev['t_start'], side='left')
-        hi_i = np.searchsorted(x, ev['t_end'], side='right')
-        for a, b in zip(lo_i, hi_i):
-            mask[a:max(b, a + 1)] = True
-        curve = pg.PlotDataItem(x, np.where(mask, y, np.nan),
-                                pen=pg.mkPen(THEME['event'], width=2),
-                                connect='finite')
-        pi.addItem(curve, ignoreBounds=True)
-        _evt_overlays.append(curve)
-
-    update_event_hists(events)
-    dur = sum(float(x[-1] - x[0]) for x, _ in segs if len(x) > 1)
-    if len(events) and dur > 0:
-        head = '<b>发现 %d 个事件 · %s</b>' % (len(events),
-                                              fmt_si(len(events) / dur, 'Hz'))
-    else:
-        head = '<b>0 个事件</b>'
-    frac = analysis.in_band_fraction(segs, evt_mode.currentText(), lo, hi)
-    if frac is not None and frac > 0.5:
-        head += ('<br><span style="color:%s">信号 %.0f%% 的时间在带内：带子圈住了'
-                 '基线/主态，inside 模式会把它整体判成事件——请把带子收窄到'
-                 '单一电平台</span>' % (THEME['A'], frac * 100))
-    if len(events) > 50000:
-        head += ('<br><span style="color:%s">事件数异常大（%d）：建议开启'
-                 '「检测平滑」1–2 ms、增大「最短 (ms)」，并检查 Y 范围是否'
-                 '圈住了基线</span>' % (THEME['A'], len(events)))
-    evt_headline.setText(head)
-    if len(events):
-        txt = ('dwell: median=%s  mean=%s   level: median=%s'
-               % (fmt_si(float(np.median(events['dwell'])), 's'),
-                  fmt_si(float(events['dwell'].mean()), 's'),
-                  fmt_si(float(np.median(events['y_level'])), cur_yunit)))
-    else:
-        txt = ''
-    notes = ['h=%s (= %.4g·σ, σ=%s)'
-             % (fmt_si(res.h, cur_yunit), res.h / res.sigma if res.sigma else 0,
-                fmt_si(res.sigma, cur_yunit))]
-    if res.boundary_discarded:
-        notes.append('%d 个边界事件被丢弃（进入或离开未被观测到，即事件跨越数据首尾）'
-                     % res.boundary_discarded)
-    if res.duty_discarded:
-        notes.append('%d 个合并事件因带内占比 < %.0f%% 被丢弃'
-                     '（多为 spike 顶部碎片链）'
-                     % (res.duty_discarded, evt_duty.value() * 100))
-    evt_stats.setText(txt + '<br>' + '<br>'.join(notes))
-
-
-def _evt_clear():
-    """清空：remove all results and hide the band. Detection stays off and
-    the tab stays silent on re-entry until a new band is drawn."""
-    global _band_placed, _band_cleared
-    _band_placed = False
-    _band_cleared = True
-    band_region.hide()
-    run_detection()
-
-
 def clear_analysis():
-    """Clear Amp regions, event overlays and panel contents. The Detect band
-    stays while Detect is on (it is a mode control, not a result)."""
+    """Clear button: drop the Amp regions (grab records are an analysis
+    logbook and stay)."""
     clear_amp_regions()
-    run_detection()
     amp_recompute()
 
 
-def _place_band():
-    """Auto-place the Y-range band on the event side of the amplitude
-    distribution -- never on the baseline: an inside-mode band hugging the
-    baseline flags half the trace as "events" (the G0 S19 green-wash bug).
-    No-op without data; remembers that the band was placed."""
-    global _band_placed, _band_syncing
-    if not last_data:
-        return
-    pooled = np.concatenate([y[::max(1, len(y) // 100000)]
-                             for _, y, _, _ in last_data])
-    p1, p25, p50, p75, p99 = np.percentile(pooled, [1, 25, 50, 75, 99])
-    if p99 - p50 >= p50 - p1:
-        rng = (float(p75), float(p99))            # heavier upper tail
-    else:
-        rng = (float(p1), float(p25))             # heavier lower tail
-    if rng[1] > rng[0]:
-        _band_syncing = True
-        try:
-            band_region.setRegion(rng)
-        finally:
-            _band_syncing = False
-        _band_placed = True
-        _sync_fields_from_band()
+# --- Activation: the last-clicked analysis area owns the Shift+drag gesture --
+#   Clicking anywhere in the Amplitude column arms amplitude mode (Shift+
+#   drag on the main plot = horizontal time region); clicking anywhere in
+#   the Event panel arms event mode (Shift+drag = XY detection rectangle).
+#   Clicks in the main plot / left column never change the mode -- the plot
+#   is a shared canvas. Folding the amp column disarms amplitude mode and
+#   deletes its regions; folding the Event panel freezes its rectangles.
+_ui_mode = ['event']
 
 
 def _amp_active():
-    """Amplitude mode is armed: its tab is open and the panel is expanded."""
-    return (not sec_dist.is_collapsed()
-            and dist_tabs.currentIndex() == 0)
+    """Amplitude mode armed: amp column clicked last, column open."""
+    return _ui_mode[0] == 'amp' and not amp_col.is_collapsed()
 
 
-def _evt_active():
-    """Detection is armed: its tab is open and the panel is expanded."""
-    return (not sec_dist.is_collapsed()
-            and dist_tabs.currentIndex() == 1)
+# activation styles: armed = accent-blue pill, idle = quiet grey; same
+# padding on both so switching modes never jiggles the layout
+_HINT_ON = ('color:%s; background:%s; border-radius:4px; padding:2px 6px;'
+            ' font-weight:bold;' % (THEME['accent'], THEME['accent_tint']))
+_HINT_OFF = 'color:#999; padding:2px 6px;'
+_HINT_PAD = 'padding:2px 6px;'
+_HEADER_QSS = ('QToolButton { border: none; text-align: left; padding: 2px;'
+               ' font-weight: bold; color: %s; }')
 
 
-_dist_tab_prev = [0]
+def _mode_header(btn, on):
+    """Section-header colour mark: the fold button of the ARMED analysis
+    area renders in accent blue (mode stays visible even when the panel
+    is tall and its hint row is scrolled out of sight)."""
+    btn.setStyleSheet(_HEADER_QSS % (THEME['accent'] if on else THEME['fg']))
 
 
-def _dist_view_changed(*_):
-    """Tab switch / panel collapse: opening Amplitude or Events activates
-    that mode; leaving Amplitude deletes its regions, leaving Events (or
-    collapsing the panel) stops the detection and clears its highlights.
-    Re-entering restores the band (and re-runs)."""
-    idx = dist_tabs.currentIndex()
-    was = _dist_tab_prev[0]
-    if was == 0 and idx != 0:
+def _refresh_mode_hints():
+    """Update the activation hints AND the section headers: the armed
+    analysis area is announced in accent blue (hint pill + fold-button
+    colour), the other one stays quiet grey."""
+    amp_on = _amp_active()
+    if amp_on and amp_regions:
+        amp_hint.setText('')
+        amp_hint.setToolTip('')
+        amp_hint.setStyleSheet(_HINT_PAD)
+    else:
+        amp_hint.setText(T('amp.hint') if amp_on else T('amp.hint.off'))
+        amp_hint.setToolTip(T('amp.tip.hint'))
+        amp_hint.setStyleSheet(_HINT_ON if amp_on else _HINT_OFF)
+    evt_on = _grab_active()
+    grab_hint.setText(T('grab.hint') if evt_on else T('grab.hint.off'))
+    grab_hint.setStyleSheet(_HINT_ON if evt_on else _HINT_OFF)
+    _mode_header(amp_col.btn, amp_on)
+    _mode_header(sec_dist.btn, evt_on)
+
+
+def _set_ui_mode(mode):
+    was = _ui_mode[0]
+    if was == mode:
+        return
+    _ui_mode[0] = mode
+    if was == 'amp':
         clear_amp_regions()             # 切走即清除全部区域（用户要求）
     amp_recompute()
-    if _evt_active():
-        band_region.setMovable(True)
-        if not _band_placed and not _band_cleared:
-            _place_band()                     # [清空] keeps the tab silent
-    _dist_tab_prev[0] = idx
-    run_detection()                     # off-state hides band + clears results
+    _grab_roi_set_interactive(_grab_active())   # rects freeze outside event mode
+    _grab_show_selected()
+    _grab_show_overlays()
+    _refresh_mode_hints()
+
+
+def _amp_col_toggled(*_):
+    """Amp column fold/unfold: folding disarms amplitude (the mode falls
+    back to event) and deletes its regions."""
+    if amp_col.is_collapsed():
+        if _ui_mode[0] == 'amp':
+            _ui_mode[0] = 'event'
+        clear_amp_regions()
+        amp_recompute()
+        _grab_roi_set_interactive(_grab_active())
+        _grab_show_selected()
+        _grab_show_overlays()
+    _refresh_mode_hints()
+
+
+def _event_panel_toggled(*_):
+    """Event panel fold/unfold: folding freezes its rectangles and clears
+    the green highlights (the records themselves stay)."""
+    _grab_roi_set_interactive(_grab_active())
+    _grab_show_selected()
+    _grab_show_overlays()
+    _refresh_mode_hints()
 
 
 def _clear_layout(lay):
@@ -1914,6 +3119,9 @@ def _refresh_region_list():
         lo, hi = r.getRegion()
         text = pg.QtWidgets.QLabel('#%d   %.6g – %.6g %s'
                                    % (k, lo, hi, cur_xunit))
+        text.setSizePolicy(pg.QtWidgets.QSizePolicy.Ignored,
+                           pg.QtWidgets.QSizePolicy.Preferred)  # narrow column
+        text.setToolTip(text.text())
         rm = pg.QtWidgets.QPushButton('×')
         rm.setFlat(True)
         rm.setFixedWidth(18)
@@ -1935,16 +3143,14 @@ def _remove_region(r):
     amp_recompute()
 
 
-# -- Y-range numeric fields <-> threshold band, two-way sync --------------------
-
-_band_syncing = False
+# -- SI display-unit scale shared by the Amp ruler and the Grab readouts -------
 
 _yunit_cache = None   # (_data_stamp, factor, si_prefix)
 
 
 def _yunit_scale():
-    """(factor, prefix) for the Y-range fields: an SI prefix chosen so the
-    band numbers are readable (an A-native trace is edited in pA)."""
+    """(factor, prefix) for Y-value display: an SI prefix chosen so the
+    numbers are readable (an A-native trace is shown in pA)."""
     global _yunit_cache
     if _yunit_cache is None or _yunit_cache[0] != _data_stamp:
         e, prefix = 0, ''
@@ -1968,145 +3174,2038 @@ def _yunit_scale():
     return _yunit_cache[1], _yunit_cache[2]
 
 
-def _sync_fields_from_band(*_):
-    global _band_placed, _band_cleared
-    _band_placed = True                       # the band was moved: user intent
-    _band_cleared = False
-    if _band_syncing:
-        return
-    lo, hi = band_region.getRegion()
-    f, _ = _yunit_scale()
-    evt_lo.setText(evt_lo._fmt(lo / f))       # native axis -> display unit
-    evt_hi.setText(evt_hi._fmt(hi / f))
+# -- Grab tab: scoped detection, one curated event per row ------------------------
+#   Shift+drag an XY rectangle in the main plot (X = time scope, Y = the
+#   event band). Detection runs inside it and EVERY detected event becomes
+#   ONE row in the record list -- the user's unit of analysis (dwell is the
+#   quantity of interest, one curated event per row). Rows produced by the
+#   same rectangle form a GROUP: they share the rectangle's colour, bounds,
+#   params snapshot and source annotation.
+#
+#   The rectangle is a pg.ROI: interior drag translates, the four edge
+#   handles resize; a live drag previews the event count (150 ms debounce,
+#   strided), release re-detects in full with the CURRENT tab params and
+#   REPLACES the whole group's rows (an edit re-scoops: rows the user had
+#   deleted manually come back -- documented resurrection semantics).
+#   Grabs that detect nothing keep their rectangle so the user can adjust
+#   the edges until the event is complete (boundary events are discarded:
+#   an event must fall entirely inside the rectangle).
+#
+#   Records/groups survive tree/file switches (the list is an analysis
+#   logbook); rectangles and the detail view only re-attach while the exact
+#   source data (file + join state + trace labels) is displayed again.
+
+grab_plot.setDownsampling(auto=True, mode='peak')
+grab_plot.setClipToView(True)
+
+grab_records = []        # ONE dict per EVENT, creation order
+_grab_groups = {}        # group id -> group dict (rectangle + params)
+_grab_rects = {}         # group id -> pg.ROI in the main plot
+_grab_items = {}         # event id -> QTreeWidgetItem in grab_tree
+_grab_selected = None    # EVENT id shown in the detail view
+_grab_focus_gid = None   # group shown instead when it has no rows (yet)
+_grab_overlays = []      # green highlight curves in the MAIN plot
+_grab_live_gid = [None]  # group being live-dragged (debounce target)
+_grab_next_eid = [1]
+_grab_next_gid = [1]
+_GRAB_MAX_EVENTS = 500   # refuse to row-ify more events than this
+
+_GRAB_DETAIL_YSPAN = 2.0    # detail-view uniform Y width = this x mean
+                             # per-event region span (region = displayed
+                             # data min-max inside the event's X window)
 
 
-def _sync_band_from_fields(*_):
-    global _band_syncing, _band_placed, _band_cleared
-    if _band_syncing:
+def _grab_active():
+    """Event mode armed: event panel clicked last, panel expanded."""
+    return _ui_mode[0] == 'event' and not sec_dist.is_collapsed()
+
+
+def _grab_source_key():
+    """Identity of the data a group was grabbed from: file + join state +
+    the displayed trace labels."""
+    return (_loaded_file, _join_active,
+            tuple(sorted(label for _, _, label, _ in last_data)))
+
+
+def _grab_grp_matches(grp):
+    """Group belongs to the displayed data: exact source key, or the
+    intrinsic file hash when both sides have one (the .dat was moved /
+    renamed / re-located after the grab -- same content, new path)."""
+    key = _grab_source_key()
+    if grp['source_key'] == key:
+        return True
+    fp = grp.get('file_fp')
+    return (bool(fp) and bool(_loaded_fp) and fp == _loaded_fp
+            and grp['source_key'][1:] == key[1:])
+
+
+def _grab_rec_source_matches(rec):
+    """Row is live on the current display. Grouped rows ride their
+    group's exact source key; GROUPLESS (CSV v3 import) rows attach per
+    event -- live iff their own trace is displayed under the row's join
+    state (see _grab_ref_display_pos)."""
+    if rec['gid'] is None:
+        return _grab_ref_display_pos(rec) is not None
+    grp = _grab_groups.get(rec['gid'])
+    return grp is not None and _grab_grp_matches(grp)
+
+
+def _grab_params():
+    return dict(mode=grab_mode.currentText(), k=grab_k.value(),
+                t_min_ms=grab_tmin.value(), merge=grab_merge.value(),
+                head_ms=grab_head.value(), smooth_ms=grab_smooth.value(),
+                duty=grab_duty.value())
+
+
+def _grab_grp_by_id(gid):
+    return _grab_groups.get(gid)
+
+
+def _grab_sorted_records():
+    """Records in CANONICAL order: global by t_start, ties by segment.
+    The export and the default tree order use this."""
+    return sorted(grab_records, key=lambda r: (r['t_start'], r['i_seg']))
+
+
+# Header-click sorting: cycle asc -> desc -> default per column. The sort
+# compares RAW record values (never the display text -- '9.99 ms' would
+# string-sort after '10.0 ms'); the # column always renumbers to the
+# CURRENT display order. The export stays in the canonical t_start order.
+_GRAB_SORT_FIELDS = {1: 't_start', 2: 'dwell', 3: 'y_level', 4: 'sigma'}
+_grab_sort_col = [None]        # None = default (canonical t_start asc)
+_grab_sort_desc = [False]
+
+
+def _grab_display_order():
+    recs = _grab_sorted_records()
+    key = _GRAB_SORT_FIELDS.get(_grab_sort_col[0])
+    if key is None:
+        return recs
+    return sorted(recs, key=lambda r: r[key], reverse=_grab_sort_desc[0])
+
+
+def _grab_header_clicked(col):
+    if col not in _GRAB_SORT_FIELDS:
         return
-    lo, hi = sorted((evt_lo.value(), evt_hi.value()))
-    if not hi > lo:
-        return
-    f, _ = _yunit_scale()
-    _band_syncing = True
-    _band_placed = True
+    if _grab_sort_col[0] == col and not _grab_sort_desc[0]:
+        _grab_sort_desc[0] = True                 # asc -> desc
+    elif _grab_sort_col[0] == col:
+        _grab_sort_col[0] = None                  # desc -> default
+        _grab_sort_desc[0] = False
+    else:
+        _grab_sort_col[0] = col                   # new column -> asc
+        _grab_sort_desc[0] = False
+    hdr = grab_tree.header()
+    if _grab_sort_col[0] is None:
+        hdr.setSortIndicatorShown(False)
+    else:
+        hdr.setSortIndicatorShown(True)
+        hdr.setSortIndicator(_grab_sort_col[0],
+                             pg.QtCore.Qt.DescendingOrder
+                             if _grab_sort_desc[0]
+                             else pg.QtCore.Qt.AscendingOrder)
+    _refresh_grab_list()
+
+
+def _grab_group_ranks():
+    """gid -> display rank (1-based, groups ordered by span start x0).
+    Internal ids never surface in user-visible text."""
+    ranks = {}
+    for i, gid in enumerate(sorted(_grab_groups, key=lambda g: _grab_groups[g]['x0'])):
+        ranks[gid] = i + 1
+    return ranks
+
+
+def _grab_rec_by_id(rid):
+    for rec in grab_records:
+        if rec['id'] == rid:
+            return rec
+    return None
+
+
+def _grab_new_group(x0, x1, y0, y1):
+    gid = _grab_next_gid[0]
+    _grab_next_gid[0] += 1
     try:
-        band_region.setRegion((lo * f, hi * f))   # display unit -> native axis
-        run_detection()
-    finally:
-        _band_syncing = False
+        _st = os.stat(_loaded_file)
+        sz, mt = _st.st_size, _st.st_mtime
+    except (OSError, TypeError):
+        sz, mt = '', ''
+    return dict(id=gid, color=THEME['cycle'][gid % len(THEME['cycle'])],
+                x0=x0, x1=x1, y0=y0, y1=y1,
+                source_key=_grab_source_key(), params=_grab_params(),
+                file_fp=_loaded_fp, file_size=sz, file_mtime=mt,
+                events=np.empty(0, analysis.EVENT_DTYPE),
+                stats=None, error=None, ev_refs=[])
 
 
-def band_drag_update(y0, y1):
-    """Shift+drag Events gesture: live preview of the Y-range band.
+def _make_grab_roi(grp):
+    """Committed grab rectangle: edge handles resize, interior drag
+    translates (rotatable/resizable off so Shift+drag falls through to the
+    ViewBox and draws a NEW rectangle); translucent fill follows the size."""
+    roi = pg.ROI(pg.Point(grp['x0'], grp['y0']),
+                 pg.Point(grp['x1'] - grp['x0'], grp['y1'] - grp['y0']),
+                 movable=True, rotatable=False, resizable=False,
+                 pen=pg.mkPen(grp['color'], width=1),
+                 hoverPen=pg.mkPen(grp['color'], width=2),
+                 handlePen=pg.mkPen(grp['color']),
+                 handleHoverPen=pg.mkPen(THEME['fg']))
+    # IN FRONT of the curves (z=0): the edge handles must stay visible and
+    # grabbable over the trace lines; the fill is translucent anyway
+    roi.setZValue(10)
+    roi.grp_id = grp['id']
+    roi.rec_color = grp['color']
+    for _hp, _hc in (([0, 0.5], [1, 0.5]), ([1, 0.5], [0, 0.5]),
+                     ([0.5, 0], [0.5, 1]), ([0.5, 1], [0.5, 0])):
+        roi.addScaleHandle(_hp, _hc)
+    fill = pg.QtWidgets.QGraphicsRectItem(roi)
+    fill.setBrush(_tint(grp['color'], 40))
+    fill.setPen(pg.mkPen(None))
+    fill.setAcceptedMouseButtons(pg.QtCore.Qt.NoButton)
+    fill.setAcceptHoverEvents(False)
 
-    Guarded so the programmatic setRegion does not trigger the band's own
-    signals (which would run a full detection on every mouse-move)."""
-    global _band_syncing
-    lo, hi = sorted((float(y0), float(y1)))
-    _band_syncing = True
-    try:
-        band_region.setRegion((lo, hi))
-    finally:
-        _band_syncing = False
-    band_region.show()
+    def _sync_fill(*_):
+        fill.setRect(pg.QtCore.QRectF(
+            0, 0, roi.state['size'][0], roi.state['size'][1]).normalized())
+    _sync_fill()
+    roi.sigRegionChanged.connect(_sync_fill)
+    roi.sigRegionChanged.connect(lambda _r, _g=grp: _grab_roi_changed(_g))
+    roi.sigRegionChangeStarted.connect(
+        lambda _r, _g=grp: _grab_roi_touched(_g))
+    roi.sigRegionChangeFinished.connect(
+        lambda _r, _g=grp: _grab_roi_commit(_g))
+    return roi
 
 
-def band_drag_finish(y0, y1):
-    """Commit the drawn band: extents below 3% of the view height are
-    treated as accidental drags and ignored (the previous band stays)."""
-    global _band_placed, _band_cleared, _band_syncing
-    view_h = vb.viewRange()[1][1] - vb.viewRange()[1][0]
-    lo, hi = sorted((float(y0), float(y1)))
-    if hi - lo <= 0.03 * view_h:
+def _grab_roi_touched(grp):
+    """Press on a rectangle SELECTS it (thick pen): Ctrl+Delete's
+    rectangle target is the last-touched rectangle. Fires only on real
+    user grabs -- programmatic setPos emits Changed/Finished, never
+    Started -- so no _grab_syncing guard is needed."""
+    global _grab_focus_gid
+    if _grab_focus_gid != grp['id']:
+        _grab_focus_gid = grp['id']
+        _grab_apply_selection_style()
+
+
+def _grab_roi_set_interactive(on):
+    """Rectangle interaction only while the Grab tab is active: hidden
+    handles receive no events and translatable=off lets drags fall through
+    to panning."""
+    for roi in _grab_rects.values():
+        if roi.scene() is None:
+            continue
+        roi.translatable = on
+        for h in roi.handles:
+            h['item'].setVisible(on)
+
+
+def add_grab_items():
+    """Re-attach grab rectangles after plot.clear(): only groups whose data
+    is still displayed come back (the others stay list-only)."""
+    pi = plot.getPlotItem()
+    for grp in _grab_groups.values():
+        if not _grab_grp_matches(grp):
+            continue
+        roi = _grab_rects.get(grp['id'])
+        if roi is None:
+            roi = _make_grab_roi(grp)
+            _grab_rects[grp['id']] = roi
+        if roi.scene() is None:
+            pi.addItem(roi, ignoreBounds=True)
+    _grab_roi_set_interactive(_grab_active())
+
+
+def grab_drag_update(x0, x1, y0, y1):
+    """Shift+drag live preview: a dashed rubber-band rectangle (guarded, so
+    the programmatic setPos/setSize triggers no recompute)."""
+    global _grab_pending, _grab_syncing
+    if _grab_pending is None:
+        r = pg.ROI(pg.Point(x0, y0), pg.Point(x1 - x0, y1 - y0),
+                   movable=False, rotatable=False, resizable=False,
+                   pen=pg.mkPen(THEME['band'], width=1,
+                                style=pg.QtCore.Qt.DashLine))
+        r.setZValue(10)
+        fill = pg.QtWidgets.QGraphicsRectItem(r)
+        fill.setBrush(_tint(THEME['band'], 40))
+        fill.setPen(pg.mkPen(None))
+        fill.setAcceptedMouseButtons(pg.QtCore.Qt.NoButton)
+        fill.setAcceptHoverEvents(False)
+        r.sigRegionChanged.connect(
+            lambda: fill.setRect(pg.QtCore.QRectF(
+                0, 0, r.state['size'][0], r.state['size'][1]).normalized()))
+        fill.setRect(pg.QtCore.QRectF(0, 0, x1 - x0, y1 - y0))
+        plot.getPlotItem().addItem(r, ignoreBounds=True)
+        _grab_pending = r
         return
-    _band_syncing = True
+    _grab_syncing = True
     try:
-        band_region.setRegion((lo, hi))
+        _grab_pending.setPos((x0, y0), finish=False)
+        _grab_pending.setSize((x1 - x0, y1 - y0), finish=False)
     finally:
-        _band_syncing = False
-    _band_placed = True
-    _sync_fields_from_band()
-    run_detection()
+        _grab_syncing = False
 
 
-# -- Event table + CSV export -----------------------------------------------------
+def grab_drag_finish(x0, x1, y0, y1):
+    """Commit the drawn rectangle (X extent <=1% of the view width or Y
+    extent <=3% of the view height counts as an accidental drag): create
+    the group, detect, and give every event its own row. Zero-event and
+    error grabs KEEP the rectangle (adjust its edges until the event is
+    complete); a grab catching more than _GRAB_MAX_EVENTS events is
+    refused (the list would be unmanageable)."""
+    global _grab_pending, _grab_focus_gid
+    if _grab_pending is not None:
+        if _grab_pending.scene() is not None:
+            plot.getPlotItem().removeItem(_grab_pending)
+        _grab_pending = None
+    if not last_data:
+        return
+    xr = vb.viewRange()[0]
+    yr = vb.viewRange()[1]
+    if ((x1 - x0) <= 0.01 * (xr[1] - xr[0])
+            or (y1 - y0) <= 0.03 * (yr[1] - yr[0])):
+        return
+    if _doc is _DOC_CLOSED:
+        _doc_open_untitled()     # the first committed grab births the doc
+    grp = _grab_new_group(x0, x1, y0, y1)
+    _grab_groups[grp['id']] = grp
+    roi = _make_grab_roi(grp)
+    _grab_rects[grp['id']] = roi
+    plot.getPlotItem().addItem(roi, ignoreBounds=True)
+    _grab_roi_set_interactive(_grab_active())
+    _grab_detect(grp)
+    n = len(grp['events'])
+    if n > _GRAB_MAX_EVENTS:
+        _grab_drop_group(grp['id'])
+        grab_stats.setToolTip('')
+        grab_stats.setText(
+            T('amp.over.commit', c=THEME['A'], n=n, cap=_GRAB_MAX_EVENTS))
+        _grab_show_overlays()
+        return
+    if grp['error'] or n == 0:
+        # keep the rectangle: the user adjusts its edges until the event is
+        # complete (or fixes the band / params); the focus group renders
+        # the guidance in the detail view
+        if _grab_selected is not None:
+            _grab_select(None)
+        _grab_focus_gid = grp['id']
+        _grab_show_selected()
+        _grab_show_overlays()
+        return
+    _grab_focus_gid = None
+    _grab_sync_group(grp)
+    _grab_select(grp['_first_eid'])
+    _refresh_grab_list()
 
-_evt_dialog = None
-_last_events = None
-_last_labels = []
+
+def _grab_drop_group(gid):
+    """Remove a group: its rectangle and (by construction) all its rows."""
+    global _grab_focus_gid
+    roi = _grab_rects.pop(gid, None)
+    if roi is not None and roi.scene() is not None:
+        plot.getPlotItem().removeItem(roi)
+    _grab_groups.pop(gid, None)
+    if _grab_focus_gid == gid:
+        _grab_focus_gid = None
 
 
-def _write_events_csv(path):
-    """Full event list as CSV (the on-screen table is capped; this is not)."""
-    if _last_events is None or not len(_last_events):
+def _grab_detect(grp, full=True):
+    """Scoped detection for one group against the data it was grabbed from
+    (only callable while that data is displayed). The rectangle's Y span IS
+    the band (lo/hi); ValueError lands in grp['error']. Fills
+    grp['events'/'stats']; does NOT touch the rows (that is
+    _grab_sync_group)."""
+    p = grp['params']
+    segs = analysis_segments(1, head_s=p['head_ms'] * 1e-3,
+                             smooth_ms=p['smooth_ms'])
+    total = sum(len(t) for t, _ in segs)
+    stride = 1 if full else max(1, total // 200000)
+    segs = analysis.slice_segments(segs, grp['x0'], grp['x1'], stride)
+    grp['error'] = None
+    try:
+        res = analysis.detect_events_segments(
+            segs, mode=p['mode'], lo=grp['y0'], hi=grp['y1'], h=None,
+            k=p['k'], t_min=_tmin_decimation(p['t_min_ms'], p['smooth_ms']),
+            merge_gap=p['merge'], duty_min=p['duty'])
+    except ValueError as exc:
+        grp['error'] = str(exc)
+        grp['events'] = np.empty(0, analysis.EVENT_DTYPE)
+        grp['stats'] = None
+        grp['ev_refs'] = []
+        return
+    grp['events'] = (res.events.copy() if len(res.events)
+                     else np.empty(0, analysis.EVENT_DTYPE))
+    grp['ev_refs'] = _grab_ev_refs(grp)
+    dur = sum(float(t[-1] - t[0]) for t, _ in segs if len(t) > 1)
+    grp['stats'] = dict(n=len(grp['events']), dur=dur, h=res.h,
+                        sigma=res.sigma,
+                        boundary=res.boundary_discarded,
+                        duty_disc=res.duty_discarded)
+
+
+def _grab_trace_ref(index, trace):
+    """Fingerprint of a source trace: tree path + header shape (sample
+    count / interval / y unit). Header-only -- no data read -- so the same
+    fingerprint can be matched against ANY trace of a bundle on load."""
+    return (int(index[0]), int(index[1]), int(index[2]), int(index[3]),
+            int(trace.DataPoints), float(trace.XInterval), trace.YUnit)
+
+
+def _grab_ev_refs(grp):
+    """Per-event source-trace refs aligned with grp['events'] (None when
+    the mapping cannot be established). Must run while the group's source
+    data is still displayed.
+
+    Non-join: i_seg indexes the non-empty slices in last_data order --
+    replay the same keep-rule (span must contain a prepped sample).
+    Join: one concatenated axis; the per-trace accumulation advances by
+    FULL sweep durations, so the display seams locate each event's sweep
+    (side='left': an event starting exactly at a seam belongs to the
+    trace ENDING there, whose tail events it is)."""
+    evs = grp['events']
+    refs = [None] * len(evs)
+    if not len(evs):
+        return refs
+    p = grp['params']
+    prepped = _prepped(p['head_ms'] * 1e-3, p['smooth_ms'])
+    if not prepped or len(prepped) > len(last_data_idx):
+        return refs
+    if _join_active:
+        seams = []
+        t = float(prepped[0][3].XStart)
+        for _x, _y, _label, trace, n_full in prepped:
+            t += n_full * float(trace.XInterval)
+            seams.append(t)
+        seams = seams[:-1]
+        for j, t0 in enumerate(evs['t_start']):
+            k = int(np.searchsorted(seams, float(t0), side='left'))
+            if 0 <= k < len(prepped):
+                refs[j] = _grab_trace_ref(last_data_idx[k], prepped[k][3])
+        return refs
+    kept = [k for k, (x, y, _label, _trace, _n) in enumerate(prepped)
+            if len(x) and ((x >= grp['x0']) & (x <= grp['x1'])).any()]
+    for j, seg_i in enumerate(evs['i_seg']):
+        if 0 <= int(seg_i) < len(kept):
+            k = kept[int(seg_i)]
+            refs[j] = _grab_trace_ref(last_data_idx[k], prepped[k][3])
+    return refs
+
+
+def _grab_raw_segs_for(grp):
+    """RAW (unsmoothed) segments of the group's span in DETECTION order
+    (non-empty per trace; single joined seg with Join on). Used for the
+    per-event noise sigma -- the smoothed detection arrays would
+    underestimate the noise. Monotonic axes -> searchsorted slices, never
+    full-axis boolean masks (the live rectangle-drag preview calls this
+    on ~1e7-sample joined axes)."""
+    x0, x1 = grp['x0'], grp['x1']
+    if _join_active and _joined_display is not None:
+        xs, ys = _joined_display
+        i0 = int(np.searchsorted(xs, x0, side='left'))
+        i1 = int(np.searchsorted(xs, x1, side='right'))
+        return [(ys[i0:i1], xs[i0:i1])] if i1 > i0 else []
+    segs = []
+    for x, y, label, trace in last_data:
+        i0 = int(np.searchsorted(x, x0, side='left'))
+        i1 = int(np.searchsorted(x, x1, side='right'))
+        if i1 > i0:
+            segs.append((y[i0:i1], x[i0:i1]))
+    return segs
+
+
+_NOISE_PREVIEW_CAP = 100_000   # per-segment sample cap for the ADVISORY
+# rect-level envelope below -- percentile sorts on a full joined span
+# (~1e7 samples) take seconds each and were the rectangle-drag lag
+
+
+def _grab_segment_noise(grp, raw_segs):
+    """RECT-level baseline envelope (5-95 percentile half-width of the RAW
+    signal around its LOCAL level) -- only used for the row-less group
+    guidance (0-event tuning / live preview), where there is no event yet
+    and the question is 'is this stretch's baseline clean enough to
+    bother'. Rows themselves carry the per-EVENT envelope
+    (_grab_event_noise); same estimator everywhere. Native y units.
+    ADVISORY ONLY: each segment is stride-subsampled to
+    _NOISE_PREVIEW_CAP points first (the guidance line does not need
+    full resolution; the exact per-event numbers at commit run on
+    dwell-sized crops and are unaffected)."""
+    ev = grp['events']
+    sigmas = []
+    for k, (y, x) in enumerate(raw_segs):
+        if len(y) > _NOISE_PREVIEW_CAP:
+            _stride = -(-len(y) // _NOISE_PREVIEW_CAP)   # ceil division
+            y, x = y[::_stride], x[::_stride]
+        evs = [(float(a), float(b), float(l)) for a, b, g, l in
+               zip(ev['t_start'], ev['t_end'], ev['i_seg'], ev['y_level'])
+               if g == k]
+        mask = np.zeros(len(x), dtype=bool)
+        for t0, t1, _ in evs:
+            mask |= (x >= t0) & (x <= t1)
+        base = (float(np.median(y[~mask])) if (~mask).any()
+                else float(np.median(y)))
+        local = np.full(len(y), base)
+        for t0, t1, lev in evs:
+            local[(x >= t0) & (x <= t1)] = lev
+        resid = y - local
+        resid = resid[np.isfinite(resid)]
+        if resid.size:
+            sigmas.append(float(np.percentile(resid, 95)
+                                - np.percentile(resid, 5)) / 2.0)
+        else:
+            sigmas.append(0.0)
+    return sigmas
+
+
+def _grab_event_noise(ev, raw_segs):
+    """Per-EVENT noise: the 5-95 PERCENTILE ENVELOPE half-width of the RAW
+    samples inside the event's own span around the event's own level --
+    '90% of the samples stay within level +- this'. Unlike the MAD (which
+    the user rejected twice: the robust median scatter deliberately throws
+    away exactly the spikes/junk that differ between events, so it came
+    out identical everywhere), the envelope GROWS with spike chains and
+    wobble; a lone sub-5%-of-samples poke is still discounted. Native y
+    units."""
+    k = int(ev['i_seg'])
+    if not (0 <= k < len(raw_segs)):
+        return 0.0
+    y, x = raw_segs[k]
+    i0 = np.searchsorted(x, ev['t_start'], side='left')
+    i1 = np.searchsorted(x, ev['t_end'], side='right')
+    d = y[i0:i1] - float(ev['y_level'])
+    d = d[np.isfinite(d)]
+    if d.size < 3:
+        return 0.0
+    return float(np.percentile(d, 95) - np.percentile(d, 5)) / 2.0
+
+
+def _grab_sync_group(grp):
+    """WHOLE-GROUP REPLACEMENT: drop the group's existing event rows and
+    create one fresh row per detected event (the resurrection semantics of
+    a rectangle edit). Marks grp['_first_eid'] for selection."""
+    global _grab_focus_gid, _grab_selected
+    raw_segs = _grab_raw_segs_for(grp)
+    refs = grp.get('ev_refs') or []
+    grab_records[:] = [r for r in grab_records if r['gid'] != grp['id']]
+    first = None
+    for j, e in enumerate(grp['events']):
+        eid = _grab_next_eid[0]
+        _grab_next_eid[0] += 1
+        grab_records.append(dict(
+            id=eid, gid=grp['id'], color=grp['color'],
+            t_start=float(e['t_start']), t_end=float(e['t_end']),
+            dwell=float(e['dwell']), y_level=float(e['y_level']),
+            i_seg=int(e['i_seg']),
+            sigma=_grab_event_noise(e, raw_segs),
+            trace_ref=(refs[j] if j < len(refs) else None)))
+        first = first if first is not None else eid
+    grp['_first_eid'] = first
+    _doc_touch()
+    if first is None:
+        _grab_focus_gid = grp['id']       # rows vanished: focus the group
+    else:
+        _grab_focus_gid = None
+    if _grab_selected is not None:
+        sel = _grab_rec_by_id(_grab_selected)
+        if sel is None or sel['gid'] == grp['id']:
+            _grab_selected = first        # reselect within the replaced group
+
+
+_grab_preview_timer = pg.QtCore.QTimer()
+_grab_preview_timer.setSingleShot(True)
+_grab_preview_timer.setInterval(150)
+
+
+def _grab_roi_changed(grp):
+    """Real user drag of a rectangle (programmatic moves guarded): update
+    bounds, focus the dragged group, then a debounced strided preview of
+    the event COUNT (rows are only replaced on release)."""
+    global _grab_focus_gid
+    if _grab_syncing:
+        return
+    roi = _grab_rects.get(grp['id'])
+    if roi is None:
+        return
+    px, py = roi.pos()
+    w, h = roi.size()
+    grp['x0'], grp['x1'] = float(min(px, px + w)), float(max(px, px + w))
+    grp['y0'], grp['y1'] = float(min(py, py + h)), float(max(py, py + h))
+    if _grab_selected is not None:
+        _grab_select(None)          # preview follows the dragged group
+    _grab_focus_gid = grp['id']
+    _grab_live_gid[0] = grp['id']
+    _grab_preview_timer.start()
+
+
+def _grab_live_preview():
+    """Debounced strided re-detection while a rectangle is being dragged:
+    preview the event count in the stats line only (no row churn)."""
+    grp = _grab_grp_by_id(_grab_live_gid[0])
+    if grp is None or not _grab_grp_matches(grp):
+        return
+    _grab_detect(grp, full=False)
+    _grab_show_selected()
+
+
+_grab_preview_timer.timeout.connect(_grab_live_preview)
+
+
+def _grab_roi_commit(grp):
+    """Drag finished: re-detect in full with the CURRENT tab params and
+    replace the whole group's rows (deleted rows come back -- documented)."""
+    if _grab_syncing:
+        return
+    _grab_preview_timer.stop()
+    _grab_live_gid[0] = None
+    grp['params'] = _grab_params()
+    _grab_detect(grp)
+    n = len(grp['events'])
+    if n > _GRAB_MAX_EVENTS:
+        grab_stats.setToolTip('')
+        grab_stats.setText(
+            T('amp.over.edit', c=THEME['A'], n=n, cap=_GRAB_MAX_EVENTS))
+        return
+    _grab_sync_group(grp)
+    if grp['_first_eid'] is not None:
+        _grab_select(grp['_first_eid'])
+    _refresh_grab_list()
+    _grab_show_selected()
+    _grab_show_overlays()
+
+
+def _grab_crop(x, y, t0, t1):
+    """Samples with t0 <= t <= t1 as (x, y) slices, or None -- O(log n)
+    via searchsorted. Green-highlight data is ALWAYS cropped through
+    this: never wrap full-segment arrays (with or without a NaN mask) in
+    an event curve -- a highlight that renders rectangle-length paths
+    per paint is what made [显示全部] lag with many groups."""
+    i0 = np.searchsorted(x, t0, side='left')
+    i1 = np.searchsorted(x, t1, side='right')
+    return (x[i0:i1], y[i0:i1]) if i1 > i0 else None
+
+
+def _grab_event_trace_pos(grp, i_seg):
+    """last_data position of the trace a detection i_seg refers to.
+    slice_segments drops empty segments, so i_seg numbers the KEPT ones:
+    replay the keep-rule (>=1 sample inside the group span) against the
+    cached prepped segments, which align 1:1 with last_data order."""
+    p = grp['params']
+    segs = analysis_segments(1, head_s=p['head_ms'] * 1e-3,
+                             smooth_ms=p['smooth_ms'])
+    kept = [k for k, (x, _y) in enumerate(segs)
+            if len(x) and np.searchsorted(x, grp['x1'], side='right')
+            > np.searchsorted(x, grp['x0'], side='left')]
+    return kept[int(i_seg)] if 0 <= int(i_seg) < len(kept) else None
+
+
+def _grab_group_span_curves(grp, spans=None):
+    """CROPPED green-highlight data for a group's events (default: all of
+    them): per span, searchsorted-slice the prepped segment its i_seg
+    maps onto. Event-sized arrays by construction, so the no-downsample /
+    no-clip highlight curves stay cheap however long the segments are."""
+    p = grp['params']
+    segs = analysis_segments(1, head_s=p['head_ms'] * 1e-3,
+                             smooth_ms=p['smooth_ms'])
+    kept = [k for k, (x, _y) in enumerate(segs)
+            if len(x) and np.searchsorted(x, grp['x1'], side='right')
+            > np.searchsorted(x, grp['x0'], side='left')]
+    out = []
+    for t0, t1, g in (_grab_group_spans(grp) if spans is None else spans):
+        k = kept[int(g)] if 0 <= int(g) < len(kept) else None
+        if k is None:
+            continue
+        c = _grab_crop(segs[k][0], segs[k][1], t0, t1)
+        if c is not None:
+            out.append(c)
+    return out
+
+
+# Resolution of saved trace fingerprints against the loaded bundle,
+# memoised per data stamp (the walk + header scan are pure bundle state;
+# _data_stamp bumps on every replot, i.e. on every load/tree change).
+_grab_res_stamp = [-1]
+_grab_res_pool = []
+_grab_res_map = {}
+
+
+def _grab_resolve_ref(ref):
+    """Resolve one saved fingerprint against the loaded bundle:
+    (index tuple or None, 'path'|'content'|'content?'|None)."""
+    if ref is None:
+        return None, None
+    if _grab_res_stamp[0] != _data_stamp:
+        _grab_res_stamp[0] = _data_stamp
+        _grab_res_pool[:] = _walk_bundle_traces()
+        _grab_res_map.clear()
+    if ref not in _grab_res_map:
+        _grab_res_map[ref] = _import_match_ref(ref, _grab_res_pool)
+    return _grab_res_map[ref]
+
+
+def _grab_row_file_ok(rec):
+    """A groupless row may only attach to the loaded file when that file
+    IS the row's saved source -- intrinsic hash when available (v6,
+    path-free), else path / basename+size -- so pure header coincidences
+    must not attach rows to unrelated files."""
+    return _import_file_matches(rec.get('source_file', ''),
+                                rec.get('file_size'),
+                                rec.get('file_hash'))
+
+
+def _grab_ref_display_pos(rec):
+    """last_data position of a groupless row's source trace, or None when
+    the row cannot attach: source file mismatch, fingerprint unresolved,
+    join state differs (t_start axis semantics), or trace not shown."""
+    ref = rec.get('trace_ref')
+    if ref is None or not _grab_row_file_ok(rec):
+        return None
+    if bool(rec.get('join', False)) != _join_active:
+        return None
+    idx, _how = _grab_resolve_ref(ref)
+    if idx is None:
+        return None
+    try:
+        return last_data_idx.index(idx)
+    except ValueError:
+        return None
+
+
+def _grab_group_spans(grp):
+    """(t0, t1, i_seg) per detected event of the group's last detection."""
+    ev = grp['events']
+    return [(float(a), float(b), int(g))
+            for a, b, g in zip(ev['t_start'], ev['t_end'], ev['i_seg'])]
+
+
+def _peak_decimate(x, y, cap):
+    """Envelope-preserving decimation to <= cap OUTPUT samples: per bin
+    the min and max y in x order (the same idea as pyqtgraph's peak
+    downsampling, done ONCE here at creation so per-frame rendering is
+    just the points). Spikes survive -- the envelope touches every local
+    extreme."""
+    bins = max(1, cap // 2)                  # each bin emits min+max (2 pts)
+    w = -(-len(x) // bins)                   # ceil: samples per bin
+    if w <= 1:
+        return x, y
+    n = len(x) // w
+    xb = x[:n * w].reshape(n, w)
+    yb = y[:n * w].reshape(n, w)
+    rows = np.arange(n)
+    imin = yb.argmin(axis=1)
+    imax = yb.argmax(axis=1)
+    lo = yb[rows, np.minimum(imin, imax)]
+    hi = yb[rows, np.maximum(imin, imax)]
+    x2 = np.repeat(xb[:, 0], 2)
+    y2 = np.empty(2 * n)
+    y2[0::2], y2[1::2] = lo, hi
+    return x2, y2
+
+
+_EVENT_CURVE_CAP = 2000     # painted samples per green event curve
+
+
+def _grab_add_event_curve(pi, x, y, width):
+    """Green event curve over an EVENT-SIZED cropped span -- callers crop
+    through _grab_crop; never pass full-segment arrays here. The array is
+    then envelope-decimated ONCE to <= _EVENT_CURVE_CAP samples: a 1.4 s
+    dwell at 100 kHz is ~1.4e5 samples EACH, and dozens of those at full
+    resolution were the [显示全部] lag. Downsampling/clipping stay OFF on
+    purpose afterwards: pyqtgraph's AUTO downsampling measures the view
+    span against the curve's OWN sample spacing, so a short curve inside
+    a zoomed-out view gets an over-large factor and simply vanishes (the
+    original disappearing-green bug -- it is NOT only about NaN). Capped
+    arrays make the override cheap (<= cap points per curve per frame).
+    connect='finite' guards stray NaN samples."""
+    if len(y) > _EVENT_CURVE_CAP:
+        x, y = _peak_decimate(x, y, _EVENT_CURVE_CAP)
+    curve = pg.PlotDataItem(
+        x, y, pen=pg.mkPen(THEME['event'], width=width), connect='finite')
+    pi.addItem(curve, ignoreBounds=True)
+    curve.setDownsampling(auto=False)
+    curve.setClipToView(False)
+    return curve
+
+
+def _grab_stats_tip(grp):
+    p = grp['params']
+    rank = _grab_group_ranks().get(grp['id'], '?')
+    return T('grab.tip.grp', rank=rank, mode=p['mode'],
+             k=('%.4g' % p['k']), tmin=('%g' % p['t_min_ms']),
+             merge=('%g' % p['merge']), head=('%g' % p['head_ms']),
+             smooth=('%g' % p['smooth_ms']), duty=('%g' % p['duty']),
+             x0=('%.4g' % grp['x0']), x1=('%.4g' % grp['x1']),
+             y0=('%.4g' % grp['y0']), y1=('%.4g' % grp['y1']))
+
+
+def _grab_stats_text(rec):
+    """Compact per-EVENT stats: ONE headline line (+ one optional notes
+    line, no wrapping -- vertical space is precious in the panel)."""
+    grp = _grab_groups.get(rec['gid']) if rec['gid'] is not None else None
+    if grp is None:
+        grab_stats.setToolTip('')
+        return T('grab.stats.imp', r=_grab_rank_of(rec),
+                 d=fmt_si(rec['dwell'], 's'),
+                 l=fmt_si(rec['y_level'], cur_yunit),
+                 s=fmt_si(rec['sigma'], cur_yunit))
+    grab_stats.setToolTip(_grab_stats_tip(grp))
+    head = T('grab.stats.row', r=_grab_rank_of(rec),
+             g=_grab_group_ranks().get(rec['gid'], 0),
+             d=fmt_si(rec['dwell'], 's'),
+             l=fmt_si(rec['y_level'], cur_yunit),
+             s=fmt_si(rec['sigma'], cur_yunit))
+    st = grp.get('stats') if grp else None
+    if grp is not None and grp['error']:
+        return ('%s<br><span style="color:%s">%s</span>'
+                % (head, THEME['A'], grp['error']))
+    parts = []
+    if st:
+        parts.append('h=%s' % fmt_si(st['h'], cur_yunit))
+        if st['boundary']:
+            parts.append(T('grab.stats.bd', n=st['boundary']))
+        if st['duty_disc']:
+            parts.append(T('grab.stats.dd', n=st['duty_disc']))
+    return head + ('<br>' + ' · '.join(parts) if parts else '')
+
+
+def _grab_group_stats_text(grp, preview=False):
+    """Stats for a row-less group: guidance while the user tunes the
+    rectangle (0 events / detection error / live-drag preview) -- including
+    the segment noise, so the user can judge the stretch before tuning."""
+    grab_stats.setToolTip(_grab_stats_tip(grp))
+    rank = _grab_group_ranks().get(grp['id'], '?')
+    noise = np.mean(_grab_segment_noise(grp, _grab_raw_segs_for(grp))) \
+        if not grp['error'] else 0.0
+    noise_txt = (' · ' + T('grab.w.noise',
+                            v=fmt_si(float(noise), cur_yunit))) \
+        if not grp['error'] else ''
+    if grp['error']:
+        return T('grab.grp.err', r=rank, a=fmt_si(grp['x0'], 's'),
+                 b=fmt_si(grp['x1'], 's'), c=THEME['A'], e=grp['error'])
+    st = grp['stats'] or dict(n=0, boundary=0, duty_disc=0)
+    n = len(grp['events'])
+    tag = T('grab.w.preview', n=n) if preview else T('grab.w.nev', n=n)
+    msg = T('grab.grp.head', r=rank, a=fmt_si(grp['x0'], 's'),
+            b=fmt_si(grp['x1'], 's'), tag=tag, noise=noise_txt)
+    if n > _GRAB_MAX_EVENTS:
+        msg += T('grab.overlimit', c=THEME['A'], cap=_GRAB_MAX_EVENTS)
+    elif n == 0:
+        msg += T('grab.nofull', n=st['boundary'])
+    return msg
+
+
+_dw_cache = [None, None, None]   # fingerprint, wx, wy (see _grab_detail_windows)
+
+
+def _grab_detail_windows():
+    """UNIFORM detail-view window sizes so events compare fairly: every
+    event gets the same X/Y widths (averaged over ALL live rows -- grouped
+    rows via their group's source key, groupless import rows via their
+    resolved trace). X keeps the +-50% dwell context in the mean (width
+    = 2 x mean dwell). Y width = _GRAB_DETAIL_YSPAN x mean(REGION
+    min-max): each row's region is the DISPLAYED data inside its own
+    X window (searchsorted slices via _grab_view_segs -- raw two-state
+    swings included, a sigma-based width shows only the flat in-band
+    state and hides the morphology). Returns (wx, wy); wy is None when
+    no row yields a finite span (callers fall back to the band).
+
+    CACHED: the result depends only on the display (_data_stamp) and the
+    row SET -- never on WHICH row is selected -- but every selection
+    change used to redo the all-rows extent loop (~100+ ms with the
+    1316-row 500mv-low.csv, on top of every arrow key). Fingerprint =
+    (stamp, row count, sum of row ids): ids are unique integers, so
+    count+sum changes on any add/remove and the sum is order-free (rows
+    are never edited in place, only added/removed)."""
+    fp = (_data_stamp, len(grab_records),
+          sum(r['id'] for r in grab_records))
+    if _dw_cache[0] == fp:
+        return _dw_cache[1], _dw_cache[2]
+    rows = [r for r in grab_records if _grab_rec_source_matches(r)]
+    if not rows:
+        _dw_cache[:] = [fp, 2.0e-6, None]
+        return 2.0e-6, None
+    wx = 2.0 * max(float(np.mean([r['dwell'] for r in rows])), 1e-6)
+    spans = []
+    for r in rows:
+        xc = 0.5 * (r['t_start'] + r['t_end'])
+        ext = _grab_region_extent(xc - 0.5 * wx, xc + 0.5 * wx)
+        if ext is not None:
+            spans.append(ext[1] - ext[0])
+    wy = _GRAB_DETAIL_YSPAN * float(np.mean(spans)) if spans else None
+    _dw_cache[:] = [fp, wx, wy]
+    return wx, wy
+
+
+def _grab_view_segs(x0, x1):
+    """Display segments (raw, per-trace or joined) inside [x0, x1].
+    Monotonic axes -> searchsorted slices (never full-axis masks: this
+    runs on every selection change and every drag-preview tick)."""
+    if _join_active and _joined_display is not None:
+        xs, ys = _joined_display
+        i0 = int(np.searchsorted(xs, x0, side='left'))
+        i1 = int(np.searchsorted(xs, x1, side='right'))
+        return ([(xs[i0:i1], ys[i0:i1])] if i1 > i0 else []), 1
+    segs = []
+    for x, y, label, trace in last_data:
+        i0 = int(np.searchsorted(x, x0, side='left'))
+        i1 = int(np.searchsorted(x, x1, side='right'))
+        if i1 > i0:
+            segs.append((x[i0:i1], y[i0:i1]))
+    return segs, max(1, len(last_data))
+
+
+def _grab_region_extent(x0, x1):
+    """Finite min/max of everything DISPLAYED inside [x0, x1] (joined
+    axis or every trace), or None when the window holds no finite data.
+    Same slices the detail view draws, so a window sized from this
+    extent is guaranteed to show the whole raw morphology."""
+    segs, _n = _grab_view_segs(x0, x1)
+    lo, hi = np.inf, -np.inf
+    for _x, y in segs:
+        yv = y[np.isfinite(y)]
+        if yv.size:
+            lo = min(lo, float(yv.min()))
+            hi = max(hi, float(yv.max()))
+    return (lo, hi) if hi > lo else None
+
+
+def _grab_show_imported(rec):
+    """Detail view for a GROUPLESS (CSV v3 import) row: centred on the
+    event like a grouped row, but no band / params / tooltip (there is no
+    rectangle behind it). Draws only while the row's own trace is
+    displayed; otherwise a grey snapshot line saying exactly what to
+    select to bring it alive."""
+    pi = grab_plot.getPlotItem()
+    pi.clear()
+    grab_stats.setToolTip('')
+    k = _grab_ref_display_pos(rec)
+    if k is None:
+        if not _grab_row_file_ok(rec):
+            hint = T('grab.imp.otherfile')
+        else:
+            idx, _how = _grab_resolve_ref(rec.get('trace_ref'))
+            if idx is None:
+                hint = T('grab.imp.otherref')
+            elif bool(rec.get('join', False)) != _join_active:
+                hint = T('grab.imp.joinflip', label=trace_label(idx),
+                         sw=(T('grab.w.on') if rec.get('join')
+                            else T('grab.w.off')))
+            else:
+                hint = T('grab.imp.select', label=trace_label(idx))
+        grab_stats.setText(
+            T('grab.stats.imp', r=_grab_rank_of(rec),
+              d=fmt_si(rec['dwell'], 's'),
+              l=fmt_si(rec['y_level'], cur_yunit),
+              s=fmt_si(rec['sigma'], cur_yunit))
+            + '<br>' + T('grab.notlive', hint=hint))
+        return
+    wx, wy = _grab_detail_windows()
+    xc = 0.5 * (rec['t_start'] + rec['t_end'])
+    x0, x1 = xc - 0.5 * wx, xc + 0.5 * wx
+    # searchsorted slices, NEVER full-axis boolean masks: this runs on every
+    # row click and a 13M-point joined axis costs ~33 ms PER mask op vs
+    # ~0.03 ms for two binary searches (the same rule _grab_view_segs and
+    # _grab_crop already follow; only this row's own curve is sliced).
+    if _join_active and _joined_display is not None:
+        xs, ys = _joined_display
+        i0 = int(np.searchsorted(xs, x0, side='left'))
+        i1 = int(np.searchsorted(xs, x1, side='right'))
+        segs = [(xs[i0:i1], ys[i0:i1])] if i1 > i0 else []
+        c = _grab_crop(xs, ys, rec['t_start'], rec['t_end'])
+    else:
+        x, y = last_data[k][0], last_data[k][1]
+        i0 = int(np.searchsorted(x, x0, side='left'))
+        i1 = int(np.searchsorted(x, x1, side='right'))
+        segs = [(x[i0:i1], y[i0:i1])] if i1 > i0 else []
+        c = _grab_crop(x, y, rec['t_start'], rec['t_end'])
+    for x, y in segs:
+        pi.addItem(pg.PlotDataItem(x, y, pen=trace_pen(0, 1),
+                                   connect='finite'))
+    if c is not None:
+        _grab_add_event_curve(pi, c[0], c[1], 3)
+    grab_stats.setText(
+        T('grab.stats.imp', r=_grab_rank_of(rec),
+          d=fmt_si(rec['dwell'], 's'),
+          l=fmt_si(rec['y_level'], cur_yunit),
+          s=fmt_si(rec['sigma'], cur_yunit)))
+    pi.setXRange(x0, x1, padding=0.02)
+    ext = _grab_region_extent(x0, x1)
+    if wy is not None and ext is not None:
+        yc = 0.5 * (ext[0] + ext[1])
+        pi.setYRange(yc - 0.5 * wy, yc + 0.5 * wy, padding=0)
+    else:
+        span_y = max(abs(rec['y_level']) * 0.2, 3.0 * rec['sigma'], 1e-15)
+        pi.setYRange(rec['y_level'] - span_y, rec['y_level'] + span_y,
+                     padding=0)
+    if last_data:
+        pi.setLabels(bottom=('time', cur_xunit), left=('Y', cur_yunit))
+
+
+def _grab_show_selected():
+    """Detail view (left half), centred on the SELECTED EVENT with a
+    UNIFORM window (X = 2 x mean dwell of all live rows, keeping the
+    +-50% context in the mean; Y = 2 x mean region min-max, centred on
+    the event's own region midpoint) so peak sizes compare across
+    events; ONLY that event highlights green
+    (siblings stay plain -- the green marks the addressed event and
+    nothing else). Falls back to the focus group (row-less, being tuned,
+    shown at the group's own bounds) or a hint. Stats text always
+    renders from the snapshot; curves only while the source data is
+    displayed."""
+    global _grab_selected
+    pi = grab_plot.getPlotItem()
+    pi.clear()
+    rec = _grab_rec_by_id(_grab_selected)
+    if rec is not None and rec['gid'] is None:
+        _grab_show_imported(rec)
+        return
+    grp = _grab_grp_by_id(_grab_focus_gid) if rec is None \
+        else _grab_groups.get(rec['gid'])
+    if rec is None and grp is None:
+        if grab_records:
+            grab_stats.setToolTip('')
+            grab_stats.setText(T('grab.allgrey', n=len(grab_records)))
+        else:
+            grab_stats.setToolTip('')
+            grab_stats.setText(T('grab.norec'))
+        return
+    if not _grab_grp_matches(grp):
+        grab_stats.setText(
+            T('grab.otherdata.rec', r=_grab_rank_of(rec),
+              g=_grab_group_ranks().get(rec['gid'], 0),
+              stats=_grab_stats_text(rec))
+            if rec is not None else
+            T('grab.otherdata.grp',
+              r=_grab_group_ranks().get(grp['id'], 0)))
+        return
+    preview = _grab_live_gid[0] == grp['id']
+    wy = None
+    ext = None
+    if rec is None:
+        grab_stats.setText(_grab_group_stats_text(grp, preview))
+        x0, x1 = grp['x0'], grp['x1']
+        bright = None
+    else:
+        grab_stats.setText(_grab_stats_text(rec))
+        wx, wy = _grab_detail_windows()
+        xc = 0.5 * (rec['t_start'] + rec['t_end'])
+        x0, x1 = xc - 0.5 * wx, xc + 0.5 * wx
+        ext = _grab_region_extent(x0, x1)
+        bright = (rec['t_start'], rec['t_end'], rec['i_seg'])
+    segs, n_disp = _grab_view_segs(x0, x1)
+    for i, (x, y) in enumerate(segs):
+        pi.addItem(pg.PlotDataItem(x, y, pen=trace_pen(i, n_disp),
+                                   connect='finite'))
+    if bright is not None:
+        # precise raw-sample highlight: crop the event's OWN trace (the
+        # window seg list can reorder/drop traces vs detection i_seg)
+        if _join_active and _joined_display is not None:
+            xs, ys = _joined_display
+            c = _grab_crop(xs, ys, bright[0], bright[1])
+        else:
+            k = _grab_event_trace_pos(grp, bright[2])
+            c = (_grab_crop(last_data[k][0], last_data[k][1],
+                            bright[0], bright[1])
+                 if k is not None else None)
+        if c is not None:
+            _grab_add_event_curve(pi, c[0], c[1], 3)
+    band = pg.LinearRegionItem(values=(grp['y0'], grp['y1']),
+                               orientation='horizontal', movable=False,
+                               brush=_tint(THEME['band'], 30),
+                               pen=pg.mkPen(THEME['band'], width=1,
+                                            style=pg.QtCore.Qt.DashLine))
+    band.setZValue(-5)
+    pi.addItem(band, ignoreBounds=True)
+    pi.setXRange(x0, x1, padding=0.02)
+    if wy is not None and ext is not None:
+        yc = 0.5 * (ext[0] + ext[1])
+        pi.setYRange(yc - 0.5 * wy, yc + 0.5 * wy, padding=0)
+    else:
+        pad_y = 0.2 * (grp['y1'] - grp['y0'])
+        pi.setYRange(grp['y0'] - pad_y, grp['y1'] + pad_y, padding=0)
+    if last_data:
+        pi.setLabels(bottom=('time', cur_xunit), left=('Y', cur_yunit))
+
+
+def _grab_show_overlays():
+    """Green highlight in the MAIN plot. Default: ONLY the selected event
+    (the green marks the addressed event so it can be found at a glance).
+    [显示全部] audit mode: EVERY event of EVERY group still matching the
+    displayed data AND every live groupless (CSV v3 import) row, at the
+    CURRENT view scale (no zooming), the selected one boldest. All spans
+    are CROPPED to the events themselves (_grab_crop on the cached prepped
+    segments) and finite arrays ride the panel's peak downsampling -- the
+    old full-segment NaN masks rendered rectangle-length paths per paint
+    and made panning lag with many groups. Audit siblings render as ONE
+    merged NaN-separated curve built by _grab_viewall_arrays (below) --
+    1316 separate per-event curves meant ~2.6M painted points per pan
+    frame (~0.4 s) plus 0.36 s of item churn per selection (2026-10,
+    500mv-low viewall lag)."""
+    global _grab_overlays
+    pi = plot.getPlotItem()
+    for it in _grab_overlays:
+        if it.scene() is not None:
+            pi.removeItem(it)
+    _grab_overlays = []
+    rec = _grab_rec_by_id(_grab_selected)
+    if not _grab_active() or rec is None \
+            or not _grab_rec_source_matches(rec):
+        return
+    if grab_viewall_btn.isChecked():
+        X, Y = _grab_viewall_arrays(rec)
+        if X is not None:
+            cur = pg.PlotDataItem(
+                X, Y, pen=pg.mkPen(THEME['event'], width=2),
+                connect='finite')
+            pi.addItem(cur, ignoreBounds=True)
+            cur.setDownsampling(auto=False)     # rule 3: NaN separators
+            cur.setClipToView(False)            # poison peak-ds bins
+            _grab_overlays.append(cur)
+    for x, y in _grab_selected_span(rec):
+        _grab_overlays.append(_grab_add_event_curve(pi, x, y, 3))
+
+
+_VIEWALL_MIN_CAP = 64       # per-event floor in audit mode (slivers stay visible)
+_VIEWALL_PTS_PER_PX = 2.5   # audit decimation density vs on-screen event width
+_viewall_cache = [None, None, None, None]   # base fingerprint, X, Y, span
+
+
+def _viewall_span():
+    """Width of the main plot's current x view, in data units (0 = unknown)."""
+    try:
+        return float(plot.getPlotItem().viewRect().width())
+    except Exception:
+        return 0.0
+
+
+def _grab_viewall_arrays(rec):
+    """Merged audit overlay for [显示全部]: every live row's event span --
+    groups via _grab_group_span_curves (selected included, bold rides on
+    top), groupless imports via _grab_selected_span (selected EXCLUDED, it
+    draws its own bold curve) -- each cropped (iron rule 1: _grab_crop
+    searchsorted, never segment-length arrays) and envelope-decimated
+    (rule 2, VIEW-SCALE-AWARE cap: _VIEWALL_PTS_PER_PX points per pixel of
+    the event's on-screen width, floored at _VIEWALL_MIN_CAP -- at a full
+    130 s view a 17 ms event is a 0.16 px sliver and 64 points already
+    overresolve it; zoomed in the cap grows to _EVENT_CURVE_CAP for full
+    fidelity), then concatenated with NaN separators into ONE array for
+    ONE PlotDataItem. autoDownsample stays OFF (rule 3) ON PURPOSE:
+    pyqtgraph's peak method takes argmin/argmax per bin, so any bin
+    straddling a NaN separator collapses to NaN (green patches would
+    VANISH at zoom-out), and the gap-skewed mean spacing misjudges the
+    factor -- our own scale-aware cap has already bounded the array, the
+    override is free. Cache: base fingerprint = (data stamp, row-set
+    count+id sum -- rows are only ever added/removed, ids are unique
+    integers so count+sum is order-free and complete -- live group event
+    counts); the stored span tolerates 1.5x drift, so PANS are pure cache
+    hits and only a real zoom (beyond 1.5x, debounced by _viewall_timer)
+    rebuilds."""
+    span = _viewall_span()
+    base_fp = (_data_stamp, len(grab_records),
+               sum(r['id'] for r in grab_records),
+               tuple((gid, len(g['events'])) for gid, g
+                     in sorted(_grab_groups.items())
+                     if _grab_grp_matches(g)))
+    if _viewall_cache[0] == base_fp and _viewall_cache[1] is not None:
+        old = _viewall_cache[3]
+        if not (span > 0 and old > 0) \
+                or (span <= 1.5 * old and old <= 1.5 * span):
+            return _viewall_cache[1], _viewall_cache[2]
+    vw = max(1.0, float(plot.width()))
+    parts_x, parts_y = [], []
+
+    def _add(x, y):
+        dur = float(x[-1] - x[0]) if len(x) > 1 else 0.0
+        cap = (_EVENT_CURVE_CAP if span <= 0
+               else int(_VIEWALL_PTS_PER_PX * dur * vw / span))
+        cap = max(_VIEWALL_MIN_CAP, min(_EVENT_CURVE_CAP, cap))
+        if len(y) > cap:
+            x, y = _peak_decimate(x, y, cap)
+        parts_x.append(x)
+        parts_y.append(y)
+
+    for gid, grp in sorted(_grab_groups.items()):
+        if not _grab_grp_matches(grp) or not grp['events'].size:
+            continue
+        for x, y in _grab_group_span_curves(grp):
+            _add(x, y)
+    for r in grab_records:
+        if r['gid'] is not None or r is rec:
+            continue
+        for x, y in _grab_selected_span(r):
+            _add(x, y)
+    if not parts_x:
+        _viewall_cache[:] = [base_fp, None, None, span]
+        return None, None
+    nan = np.full(1, np.nan)
+    xs = [v for pair in ([nan, p] for p in parts_x) for v in pair][1:]
+    ys = [v for pair in ([nan, p] for p in parts_y) for v in pair][1:]
+    _viewall_cache[:] = [base_fp, np.concatenate(xs), np.concatenate(ys),
+                         span]
+    return _viewall_cache[1], _viewall_cache[2]
+
+
+def _viewall_zoom_rebuild():
+    """Debounced sigRangeChanged follow-up: rebuild the merged audit curve
+    only when the view actually changed scale beyond the cache's 1.5x
+    tolerance (pans keep the span -- pure cache hits, nothing to do)."""
+    if not (grab_viewall_btn.isChecked() and _grab_active()):
+        return
+    span = _viewall_span()
+    old = _viewall_cache[3]
+    if span > 0 and old > 0 and (span > 1.5 * old or old > 1.5 * span):
+        _grab_show_overlays()
+
+
+_viewall_timer = pg.QtCore.QTimer(singleShot=True)
+_viewall_timer.setInterval(150)
+_viewall_timer.timeout.connect(_viewall_zoom_rebuild)
+
+
+def _viewall_range_debounced(*_a):
+    if grab_viewall_btn.isChecked() and _grab_active():
+        _viewall_timer.start()
+
+
+plot.getPlotItem().getViewBox().sigRangeChanged.connect(
+    _viewall_range_debounced)
+
+
+def _grab_selected_span(rec):
+    """The selected event's own highlight data (cropped, event-sized).
+    Grouped rows read the group's prepped segments at the event's i_seg;
+    groupless (import) rows read the displayed arrays their trace
+    resolves to (raw samples -- no params, no smoothing to replay)."""
+    t0, t1 = rec['t_start'], rec['t_end']
+    if rec['gid'] is None:
+        k = _grab_ref_display_pos(rec)
+        if k is None:
+            return []
+        if _join_active and _joined_display is not None:
+            xs, ys = _joined_display
+            c = _grab_crop(xs, ys, t0, t1)
+        else:
+            c = _grab_crop(last_data[k][0], last_data[k][1], t0, t1)
+        return [c] if c is not None else []
+    grp = _grab_groups.get(rec['gid'])
+    if grp is None or not _grab_grp_matches(grp):
+        return []
+    return _grab_group_span_curves(grp, [(t0, t1, rec['i_seg'])])
+
+
+def _grab_rank_of(rec):
+    """Display rank (1-based) of a record: its position in the CURRENT
+    display order (respects header sorting) -- what the tree's # column
+    shows."""
+    for i, r in enumerate(_grab_display_order()):
+        if r is rec:
+            return i + 1
+    return 0
+
+
+def _grab_row(rec, rank):
+    """One row per event: rank, start time, dwell, level, segment noise."""
+    return ['%d' % rank, fmt_si(rec['t_start'], 's'),
+            fmt_si(rec['dwell'], 's'), fmt_si(rec['y_level'], cur_yunit),
+            '±' + fmt_si(rec['sigma'], cur_yunit), '']
+
+
+def _grab_row_update(rec):
+    it = _grab_items.get(rec['id'])
+    if it is None:
+        return
+    for c, txt in enumerate(_grab_row(rec, _grab_rank_of(rec))):
+        it.setText(c, txt)
+
+
+def _grab_apply_selection_style():
+    sel_gid = None
+    rec = _grab_rec_by_id(_grab_selected)
+    if rec is not None:
+        sel_gid = rec['gid']
+    elif _grab_focus_gid is not None:
+        sel_gid = _grab_focus_gid
+    for gid, roi in _grab_rects.items():
+        roi.setPen(pg.mkPen(roi.rec_color, width=2 if gid == sel_gid else 1))
+
+
+def _grab_select(rid):
+    global _grab_selected, _grab_focus_gid
+    if rid is None:
+        _grab_selected = None
+        _grab_apply_selection_style()
+        return
+    if _grab_selected == rid:
+        return
+    rec = _grab_rec_by_id(rid)
+    _grab_selected = rid
+    if rec is not None:
+        _grab_focus_gid = None          # an event selection replaces focus
+    _grab_apply_selection_style()
+    _grab_show_selected()
+    _grab_show_overlays()
+
+
+def _grab_update_summary():
+    """Running statistics under the tree over ALL rows (greyed rows from
+    other data included -- the list is the curated dataset). TWO fixed
+    lines: means, then medians."""
+    if not grab_records:
+        grab_summary.setText('')
+        return
+    dw = np.array([r['dwell'] for r in grab_records])
+    lv = np.array([r['y_level'] for r in grab_records])
+    sg = np.array([r['sigma'] for r in grab_records])
+    grab_summary.setText(
+        T('grab.summary', n=len(grab_records),
+          dm=fmt_si(float(dw.mean()), 's'),
+          lm=fmt_si(float(lv.mean()), cur_yunit),
+          sm=fmt_si(float(sg.mean()), cur_yunit),
+          dd=fmt_si(float(np.median(dw)), 's'),
+          ld=fmt_si(float(np.median(lv)), cur_yunit),
+          sd=fmt_si(float(np.median(sg)), cur_yunit)))
+
+
+def _refresh_grab_list():
+    """Rebuild the event list in the CURRENT display order (header sort
+    respected); the # column is the display RANK (recomputed every
+    refresh: deletions close the gaps, a clear restarts at 1, edits
+    re-sort automatically). Colour chip = group colour; the × delete is
+    PAINTED by _GrabDelDelegate (no per-row widgets -- see its docstring).
+    Events from other data are greyed but keep their values."""
+    grab_tree.clear()
+    _grab_items.clear()
+    for rank, rec in enumerate(_grab_display_order(), 1):
+        item = pg.QtWidgets.QTreeWidgetItem(_grab_row(rec, rank))
+        item.rec_id = rec['id']
+        pm = pg.QtGui.QPixmap(10, 10)
+        pm.fill(pg.QtGui.QColor(rec['color']))
+        item.setData(0, pg.QtCore.Qt.DecorationRole, pg.QtGui.QIcon(pm))
+        if not _grab_rec_source_matches(rec):
+            for c in range(5):
+                item.setForeground(
+                    c, pg.QtGui.QBrush(pg.QtGui.QColor('#AAAAAA')))
+        grab_tree.addTopLevelItem(item)
+        _grab_items[rec['id']] = item
+    sel = _grab_items.get(_grab_selected)
+    if sel is not None:
+        grab_tree.setCurrentItem(sel)
+    _grab_apply_selection_style()
+    _grab_update_summary()
+
+
+def _grab_tree_changed():
+    it = grab_tree.currentItem()
+    if it is None:
+        return
+    rid = getattr(it, 'rec_id', None)
+    if rid is not None and rid != _grab_selected:
+        _grab_select(rid)
+
+
+def _grab_tree_doubleclicked(item, _col):
+    """Double-click a row: jump the main view onto that event."""
+    rec = _grab_rec_by_id(getattr(item, 'rec_id', None))
+    if rec is None or not _grab_rec_source_matches(rec):
+        return
+    pad = max(2.0 * rec['dwell'], 0.01)
+    vb.setXRange(rec['t_start'] - pad, rec['t_end'] + pad, padding=0)
+
+
+_grab_last_delete_t = [0.0]
+
+
+def _grab_delete(rid):
+    """Delete ONE event row -- SURGICALLY: only that row's item is taken
+    out and the # ranks renumber in place (no tree rebuild, so no fresh
+    x-button ever slides under the cursor to catch the second click of a
+    double-click; a 250 ms guard eats that click anyway). When its group's
+    last row goes, the group and rectangle go with it. The selection falls
+    to the row that takes the deleted rank position (the neighbour), not
+    to the end of the list."""
+    global _grab_selected
+    now = time.time()
+    if now - _grab_last_delete_t[0] < 0.25:
+        return                                  # double-click's 2nd click
+    _grab_last_delete_t[0] = now
+    rec = _grab_rec_by_id(rid)
+    if rec is None:
+        return
+    item = _grab_items.pop(rid, None)
+    idx = grab_tree.indexOfTopLevelItem(item) if item is not None else None
+    if item is not None:
+        grab_tree.takeTopLevelItem(idx)         # surgical: neighbours stay
+    grab_records[:] = [r for r in grab_records if r['id'] != rid]
+    _doc_touch()
+    if rec['gid'] is not None \
+            and not any(r['gid'] == rec['gid'] for r in grab_records):
+        _grab_drop_group(rec['gid'])
+    # renumber the remaining rows in place (display order == tree order)
+    remaining = _grab_display_order()
+    for rank, r in enumerate(remaining, 1):
+        it = _grab_items.get(r['id'])
+        if it is not None:
+            it.setText(0, '%d' % rank)
+    if _grab_selected == rid:
+        _grab_selected = None
+        if remaining:
+            pos = max(0, min(idx if idx is not None else 0,
+                             len(remaining) - 1))
+            for i in [pos] + [j for j in range(len(remaining)) if j != pos]:
+                if _grab_rec_source_matches(remaining[i]):
+                    _grab_selected = remaining[i]['id']
+                    break
+        it = _grab_items.get(_grab_selected)
+        if it is not None:
+            grab_tree.setCurrentItem(it)
+        _grab_show_selected()
+        _grab_show_overlays()
+    _grab_apply_selection_style()
+    _grab_update_summary()
+
+
+def _grab_clear():
+    global _grab_selected, _grab_focus_gid
+    if grab_records:
+        _doc_touch()          # closing resets dirty after this anyway
+    for gid in list(_grab_groups):
+        _grab_drop_group(gid)
+    grab_records.clear()
+    _grab_items.clear()
+    _grab_selected = None
+    _grab_focus_gid = None
+    _refresh_grab_list()
+    _grab_show_selected()
+    _grab_show_overlays()
+
+
+def _grab_delete_group_now(gid):
+    """Delete a rectangle WITH all its rows (Ctrl+Delete on the focused
+    group -- user-decided semantics: the rectangle and its curated rows
+    go together). Selection falls to a surviving live row, else none."""
+    global _grab_selected
+    _grab_drop_group(gid)
+    grab_records[:] = [r for r in grab_records if r['gid'] != gid]
+    _doc_touch()
+    _grab_selected = None
+    first = next((r['id'] for r in grab_records
+                  if _grab_rec_source_matches(r)), None)
+    _refresh_grab_list()
+    if first is not None:
+        _grab_select(first)
+    _grab_show_selected()
+    _grab_show_overlays()
+
+
+def _delete_current_selection():
+    """Ctrl/Cmd+Delete target, by state: the last-touched grab rectangle
+    (focus group) > the selected event row > the Measure markers/drag
+    line. Grab objects only resolve while the event panel is armed.
+    Returns True when the key was consumed."""
+    if _grab_active():
+        gid = _grab_focus_gid
+        if gid is not None and gid in _grab_groups:
+            grp = _grab_groups[gid]
+            n = sum(1 for r in grab_records if r['gid'] == gid)
+            if n:
+                ranks = _grab_group_ranks()
+                ans = pg.QtWidgets.QMessageBox.question(
+                    win, T('del.rect.title'),
+                    T('del.rect.confirm', r=ranks.get(gid, '?'), n=n),
+                    pg.QtWidgets.QMessageBox.Yes | pg.QtWidgets.QMessageBox.No,
+                    pg.QtWidgets.QMessageBox.No)
+                if ans != pg.QtWidgets.QMessageBox.Yes:
+                    return True            # consumed, nothing deleted
+            _grab_delete_group_now(gid)
+            return True
+        if _grab_selected is not None:
+            _grab_delete(_grab_selected)
+            return True
+    if meas_points or meas_items or drag_items:
+        clear_meas()
+        return True
+    return False
+
+
+# -- Flat event CSV (document format) --------------------------------------------
+#   v5 = the v4 flat table + a '#' params header. One row per curated
+#   event; groups/rectangles are a GUI selection tool and are NOT stored.
+#   v6 = v5 + the file_hash column (intrinsic .dat identity: matching no
+#   longer consults the path at all; rows from v5-and-older files keep
+#   using the legacy path / basename+size fallback).
+
+_GRAB_CSV_COLUMNS = [
+    'event_id', 't_start', 't_end', 'dwell', 'y_level', 'noise_sigma',
+    'join', 'source_file',
+    'trace_g', 'trace_s', 'trace_w', 'trace_t',
+    'trace_n', 'trace_dt', 'trace_yunit',
+    'file_size', 'file_hash', 'file_mtime']
+# columns a CSV must have to be openable at all (file_hash is v6-only:
+# its absence just means legacy provenance, not a bad file)
+_GRAB_CSV_REQUIRED = [c for c in _GRAB_CSV_COLUMNS if c != 'file_hash']
+
+
+def _csv_num(row, key, default=None):
+    """CSV cell as float; '' / missing -> default."""
+    v = (row.get(key) or '').strip()
+    if v == '':
+        return default
+    try:
+        return float(v)
+    except ValueError:
+        return default
+
+
+def _import_file_matches(src_file, src_size, src_hash=None):
+    """File-layer match of the loaded .dat against the saved source.
+    Path-independent when both sides carry an intrinsic hash (v6 rows):
+    hash equality alone decides -- move / rename / cross-machine all
+    resolve without any path. Rows from older CSVs (no hash) keep the
+    legacy chain: same absolute path, or same basename + byte size.
+    Advisory only -- the structural layer below is the real test."""
+    if not _loaded_file or bundle is None:
         return False
-    np.savetxt(path, _last_events, delimiter=',',
-               header='t_start,t_end,dwell,y_level,i_seg', comments='')
-    return True
+    if src_hash and _loaded_fp:
+        return src_hash == _loaded_fp
+    if src_file and os.path.abspath(src_file) == _loaded_file:
+        return True
+    if not src_file or src_size is None:
+        return False
+    try:
+        return (os.path.basename(src_file) == os.path.basename(_loaded_file)
+                and int(src_size) == os.stat(_loaded_file).st_size)
+    except (OSError, ValueError):
+        return False
 
 
-def _export_events_csv():
-    if _last_events is None or not len(_last_events):
+def _import_fp_matches(trace, n, dt, yunit):
+    """Header fingerprint comparison (no data read). dt compared with a
+    tiny relative tolerance: same acquisition settings round-trip through
+    the CSV exactly, cross-file coincidences should not."""
+    if int(trace.DataPoints) != int(n):
+        return False
+    dtc = float(trace.XInterval)
+    if abs(dtc - dt) > 1e-9 * max(abs(dtc), abs(dt), 1e-30):
+        return False
+    return str(getattr(trace, 'YUnit', '') or '') == str(yunit)
+
+
+def _walk_bundle_traces():
+    """All trace leaves of the loaded bundle as (index tuple, node) --
+    the resolution pool for saved fingerprints. Pure .pul walk, no data
+    arrays are read."""
+    out = []
+    if bundle is None:
+        return out
+
+    def walk(index, node):
+        if len(index) == 4:
+            out.append((tuple(index), node))
+            return
+        for i in range(len(node.children)):
+            walk(index + [i], node.children[i])
+
+    try:
+        walk([], bundle.pul)
+    except Exception:
+        return out
+    return out
+
+
+def _import_match_ref(ref, pool):
+    """Match one saved fingerprint against the pool: the exact tree path
+    first (strong), then content (DataPoints/XInterval/YUnit) when the
+    path drifted. Returns (index or None, 'path'|'content'|'content?'|
+    None) -- 'content?' marks an ambiguous content hit (several traces
+    share the fingerprint; the first wins)."""
+    path = tuple(ref[:4])
+    for idx, trace in pool:
+        if idx == path and _import_fp_matches(trace, ref[4], ref[5], ref[6]):
+            return idx, 'path'
+    hits = [idx for idx, trace in pool
+            if _import_fp_matches(trace, ref[4], ref[5], ref[6])]
+    if not hits:
+        return None, None
+    return hits[0], ('content' if len(hits) == 1 else 'content?')
+
+
+def _grab_after_replot():
+    """After every replot: re-attach rectangles against the NEW display
+    (add_grab_items reads _grab_source_key from last_data), refresh the
+    GROUPLESS (imported) rows -- i_seg follows the trace's position among
+    the displayed ones (joined rows stay 0) -- then re-render the detail
+    view / summary / overlays against the new attachment state."""
+    add_grab_items()
+    for rec in grab_records:
+        if rec['gid'] is not None:
+            continue
+        k = _grab_ref_display_pos(rec)
+        rec['i_seg'] = 0 if (k is None or _join_active) else k
+    _refresh_grab_list()
+    _grab_show_selected()
+    _grab_update_summary()
+    _grab_show_overlays()
+
+
+def _grab_recalc_all():
+    """Re-detect every group still matching the displayed data with the
+    CURRENT panel params (whole-group replacement per group)."""
+    global _grab_selected
+    for grp in list(_grab_groups.values()):
+        if not _grab_grp_matches(grp):
+            continue
+        grp['params'] = _grab_params()
+        _grab_detect(grp)
+        if len(grp['events']) > _GRAB_MAX_EVENTS:
+            continue                                # message via detail view
+        _grab_sync_group(grp)
+    if _grab_selected is not None and _grab_rec_by_id(_grab_selected) is None:
+        _grab_selected = None
+    _refresh_grab_list()
+    _grab_show_selected()
+    _grab_show_overlays()
+
+
+class _CsvReject(Exception):
+    """Unrecoverable CSV input; .msg is an already-translated message."""
+
+    def __init__(self, msg):
+        super().__init__(msg)
+        self.msg = msg
+
+
+def _parse_csv_params(path):
+    """Scan the '#' header block for a v5 'params:' line -> dict or None.
+    v3/v4 files predate the header: None means 'keep current params'."""
+    params = None
+    try:
+        with open(path, errors='replace') as fh:
+            for ln in fh:
+                if not ln.startswith('#'):
+                    break
+                if ln.startswith('# params:'):
+                    kv = {}
+                    for tok in ln[len('# params:'):].split():
+                        if '=' in tok:
+                            k, v = tok.split('=', 1)
+                            kv[k.strip()] = v.strip()
+                    if kv:
+                        params = kv
+    except OSError:
+        return None
+    return params
+
+
+def _apply_doc_params(params):
+    if not params:
         return
-    path, _ = pg.QtWidgets.QFileDialog.getSaveFileName(
-        win, '导出事件 CSV',
-        os.path.join(settings.value('last_dir', ''), 'events.csv'),
-        'CSV (*.csv)')
-    if path:
-        _write_events_csv(path)
+
+    def num(key, widget):
+        try:
+            widget.set_value_quiet(float(params[key]))
+        except (KeyError, ValueError):
+            pass
+
+    if params.get('mode') in ('inside', 'outside', 'below', 'above'):
+        grab_mode.setCurrentText(params['mode'])
+    num('k', grab_k)
+    num('t_min_ms', grab_tmin)
+    num('merge', grab_merge)
+    num('head', grab_head)
+    num('smooth', grab_smooth)
+    num('duty', grab_duty)
 
 
-def _show_event_table():
-    """Non-modal table of the detected events; double-click a row to jump
-    the main view onto that event."""
-    global _evt_dialog
-    if _last_events is None or not len(_last_events):
+def _parse_grab_csv(path):
+    """Flat v3/v4/v5/v6 grab CSV -> (events, bad_rows, params|None).
+
+    v3 files auto-map their stitch column to join; v2 is rejected by its
+    group_id column (v3's columns are a strict subset of v2's 33, so the
+    missing-column check alone would let it through). v6 adds the
+    file_hash column -- optional, its absence just means legacy
+    path-based provenance."""
+    try:
+        with open(path, newline='') as fh:
+            lines = [ln for ln in fh if not ln.lstrip().startswith('#')]
+    except OSError as exc:
+        raise _CsvReject(T('csv.readfail', err=exc))
+    rdr = csv.DictReader(lines)
+    rows = list(rdr)
+    if 'group_id' in (rdr.fieldnames or []):
+        raise _CsvReject(T('csv.v2'))
+    _cols = set(rdr.fieldnames or [])
+    if 'join' not in _cols and 'stitch' in _cols:
+        for row in rows:
+            row['join'] = row.get('stitch', '')
+        _cols.add('join')
+    missing = [c for c in _GRAB_CSV_REQUIRED if c not in _cols]
+    if missing:
+        raise _CsvReject(T('csv.missing', cols=', '.join(missing)))
+    if not rows:
+        raise _CsvReject(T('csv.empty'))
+
+    evs = []
+    bad = 0
+    for row in rows:
+        ts = _csv_num(row, 't_start')
+        te = _csv_num(row, 't_end')
+        dw = _csv_num(row, 'dwell')
+        yl = _csv_num(row, 'y_level')
+        sg = _csv_num(row, 'noise_sigma')
+        if None in (ts, te, dw, yl, sg):
+            bad += 1
+            continue
+        ref = None
+        if all((row.get(c) or '').strip() for c in
+               ('trace_g', 'trace_s', 'trace_w', 'trace_t',
+                'trace_n', 'trace_dt', 'trace_yunit')):
+            try:
+                ref = (int(float(row['trace_g'])), int(float(row['trace_s'])),
+                       int(float(row['trace_w'])), int(float(row['trace_t'])),
+                       int(float(row['trace_n'])), float(row['trace_dt']),
+                       row['trace_yunit'].strip())
+            except ValueError:
+                ref = None
+        evs.append(dict(t_start=ts, t_end=te, dwell=dw, y_level=yl,
+                        sigma=sg, trace_ref=ref,
+                        join=str(row.get('join', '')).strip().lower()
+                        == 'true',
+                        source_file=(row.get('source_file') or '').strip(),
+                        file_size=_csv_num(row, 'file_size'),
+                        file_hash=(row.get('file_hash') or '').strip()
+                        or None,
+                        file_mtime=_csv_num(row, 'file_mtime')))
+    if not evs:
+        raise _CsvReject(T('csv.nousable',
+                           bad=(T('csv.badrows', n=bad) if bad else '')))
+    evs.sort(key=lambda e: e['t_start'])
+    return evs, bad, _parse_csv_params(path)
+
+
+_locate_dismissed = set()   # (src_file, src_size, src_hash) the user
+                             # cancelled the locate dialog for -- asked
+                             # once per session, not on every tab switch
+
+
+def _doc_locate_source(src_file, src_size, csv_dir, src_hash=None):
+    """Saved .dat path is gone: look for a same-named file next to the
+    CSV (the classic moved-data-folder case), then in the last data dir,
+    then in the explorer column's dir. Candidates verify by intrinsic
+    hash when the rows carry one (v6), else by byte size."""
+    base = os.path.basename(src_file) if src_file else ''
+    if not base:
+        return ''
+    pool = dict.fromkeys(filter(None, (csv_dir,
+                                       settings.value('last_dir', ''),
+                                       _exp_dir[0])))
+    for d in pool:
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        if base not in names:
+            continue
+        p = os.path.join(d, base)
+        try:
+            if src_hash:
+                if _file_fp(p) == src_hash:
+                    return p
+            elif src_size is None or os.path.getsize(p) == int(src_size):
+                return p
+        except OSError:
+            continue
+    return ''
+
+
+def _doc_set_context(src_file, src_size, join_wanted, refs, csv_dir='',
+                     src_hash=None):
+    """Restore the display context a document's rows were grabbed from:
+    load the source .dat (hash match against the loaded file -> saved
+    path -> basename search (csv dir / last dir / explorer dir) -> locate
+    dialog -> degrade to grey rows; bundle LRU makes switching between
+    two files cheap), set Join from the rows' axis semantics, select the
+    referenced traces' SERIES (refs arrive already collapsed to (g, s):
+    the join axis is paced by the displayed set, so selecting bare trace
+    leaves would drop every event-less sweep and shift every later seam).
+    Degrade, never abort. In a bundle-less (synthetic / lost-source)
+    context nothing display-side is touched: a replot with no tree
+    selection would wipe the injected display."""
+    global _join_active
+    if not src_file and not refs and not join_wanted:
+        return                          # nothing to restore (empty doc)
+    if src_file and not _import_file_matches(src_file, src_size, src_hash):
+        cand = ''
+        if (os.path.isfile(src_file)
+                and (not src_hash or _file_fp(src_file) == src_hash)):
+            # path still lives and (when known) hashes to the right file
+            cand = src_file
+        else:
+            cand = _doc_locate_source(src_file, src_size, csv_dir, src_hash)
+            if not cand and (src_file, src_size, src_hash) \
+                    not in _locate_dismissed:
+                cand, _ = pg.QtWidgets.QFileDialog.getOpenFileName(
+                    win, T('csv.locate',
+                           suffix=('：' + os.path.basename(src_file))
+                           if src_file else ''),
+                    (os.path.dirname(src_file) if src_file
+                     else csv_dir or settings.value('last_dir', '')),
+                    'Heka bundle (*.dat)')
+                if not cand:
+                    _locate_dismissed.add((src_file, src_size, src_hash))
+        if cand:
+            _locate_dismissed.discard((src_file, src_size, src_hash))
+            try:
+                load(cand)
+            except Exception as exc:
+                pg.QtWidgets.QMessageBox.warning(
+                    win, T('csv.imp.title'), T('csv.openfail', err=exc))
+    # Join carries the t-axis semantics of the saved rows. With a real
+    # bundle the toggle drives the normal replot path; bundle-less it is
+    # flipped QUIETLY (signals would replot and wipe the synthetic
+    # display the caller may have injected).
+    if join_wanted != join_btn.isChecked():
+        if bundle is not None:
+            join_btn.setChecked(join_wanted)   # -> join_toggled -> replot
+        else:
+            join_btn.blockSignals(True)
+            join_btn.setChecked(join_wanted)
+            join_btn.blockSignals(False)
+            _join_active = join_wanted
+    if refs and bundle is not None:
+        tree.blockSignals(True)
+        for it in tree.selectedItems():
+            it.setSelected(False)
+        for path in refs:
+            it = _tree_item_by_path(path)
+            if it is not None:
+                it.setSelected(True)
+        tree.blockSignals(False)
+        replot()                # re-attach + refresh live rows (grey rest)
+
+
+def _doc_restore_context():
+    """Re-derive the display context from the ACTIVE document's rows:
+    grouped rows speak through their group's source key, groupless rows
+    carry their own provenance. Feeds _doc_set_context."""
+    src_file = ''
+    src_size = None
+    src_hash = None
+    joins = set()
+    for grp in _grab_groups.values():
+        if not src_file and grp['source_key'][0]:
+            src_file = grp['source_key'][0]
+        if src_hash is None:
+            src_hash = grp.get('file_fp') or None
+        joins.add(bool(grp['source_key'][1]))
+    for r in grab_records:
+        if r['gid'] is not None:
+            continue
+        if not src_file and r.get('source_file'):
+            src_file = r['source_file']
+        if src_size is None and r.get('file_size') is not None:
+            src_size = r['file_size']
+        if src_hash is None and r.get('file_hash'):
+            src_hash = r['file_hash']
+        joins.add(bool(r.get('join', False)))
+    join_wanted = any(joins) if joins else join_btn.isChecked()
+    # Collapse refs to SERIES level: rows only carry refs for sweeps that
+    # produced events, but the join axis is paced by the DISPLAYED set --
+    # selecting the bare leaves would drop every event-less sweep from the
+    # concatenation and shift all later seams (progressive t drift, found
+    # with 200mv-high.csv: sweeps 19/37 event-less -> -5/-10 s steps).
+    refs = sorted({r['trace_ref'][:2] for r in grab_records
+                   if r.get('trace_ref')})
+    csv_dir = (os.path.dirname(_doc['path']) if _doc.get('path') else '')
+    _doc_set_context(src_file, src_size, join_wanted, refs, csv_dir,
+                     src_hash=src_hash)
+
+
+def _open_doc(path):
+    """Open a flat event CSV as a NEW analysis document tab (the current
+    documents stay open in theirs -- nothing to confirm). Opening a path
+    that already has a tab just activates it. Rows are restored exactly
+    as saved (no re-detection, no rectangles, no groups -- draw new
+    rectangles to re-grab), then the context they came from is restored.
+    Rows light up when their own trace is displayed; the rest stay grey
+    snapshots."""
+    global _doc, _grab_selected, _grab_focus_gid
+    if not path:
         return
-    ev = _last_events
-    if _evt_dialog is not None:
-        _evt_dialog.close()
-    dlg = pg.QtWidgets.QDialog(win)
-    dlg.setAttribute(pg.QtCore.Qt.WA_DeleteOnClose)
-    dlg.setWindowTitle('事件表（共 %d 个）' % len(ev))
-    lay = pg.QtWidgets.QVBoxLayout(dlg)
-    shown = ev[:1000]
-    table = pg.QtWidgets.QTableWidget(len(shown), 6)
-    table.setHorizontalHeaderLabels(
-        ['#', 'sweep', 't_start (s)', 't_end (s)', 'dwell (s)',
-         'level (%s)' % cur_yunit])
-    table.setEditTriggers(pg.QtWidgets.QAbstractItemView.NoEditTriggers)
-    table.setAlternatingRowColors(True)
-    for i, e in enumerate(shown):
-        seg = int(e['i_seg'])
-        name = _last_labels[seg] if seg < len(_last_labels) else str(seg)
-        for c, val in enumerate(('%d' % i, name,
-                                 '%.6g' % e['t_start'], '%.6g' % e['t_end'],
-                                 '%.6g' % e['dwell'], '%.6g' % e['y_level'])):
-            table.setItem(i, c, pg.QtWidgets.QTableWidgetItem(val))
-    table.resizeColumnsToContents()
-    lay.addWidget(table)
-    if len(ev) > len(shown):
-        lay.addWidget(pg.QtWidgets.QLabel(
-            '仅显示前 %d 行；CSV 导出包含全部 %d 个事件' % (len(shown), len(ev))))
+    try:
+        evs, bad, params = _parse_grab_csv(path)
+    except _CsvReject as exc:
+        pg.QtWidgets.QMessageBox.warning(win, T('csv.imp.title'), exc.msg)
+        return
+    absp = os.path.abspath(path)
+    for i, d in enumerate(_doc_list):
+        if d['path'] == absp:
+            _doc_switch(i)               # already open: just activate
+            return
+    _doc_state_capture()
+    d = {'open': True, 'path': absp, 'dirty': False, 'state': {}}
+    _doc_list.append(d)
+    _doc = d
+    _doc_activate_tab(d)
+    _apply_doc_params(params)
 
-    def _jump(row, _col):
-        e = ev[row]
-        pad = max((e['t_end'] - e['t_start']) * 2.0, 0.02)
-        vb.setXRange(e['t_start'] - pad, e['t_end'] + pad, padding=0)
+    # -- inject rows (groupless: the group machinery stays untouched)
+    for e in evs:
+        eid = _grab_next_eid[0]
+        _grab_next_eid[0] += 1
+        grab_records.append(dict(
+            id=eid, gid=None, color=THEME['import'],
+            t_start=e['t_start'], t_end=e['t_end'], dwell=e['dwell'],
+            y_level=e['y_level'], i_seg=0, sigma=e['sigma'],
+            trace_ref=e['trace_ref'], join=e['join'],
+            source_file=e['source_file'], file_size=e['file_size'],
+            file_hash=e['file_hash'], file_mtime=e['file_mtime']))
 
-    table.cellDoubleClicked.connect(_jump)
-    btns = pg.QtWidgets.QHBoxLayout()
-    b_csv = pg.QtWidgets.QPushButton('导出 CSV')
-    b_csv.clicked.connect(_export_events_csv)
-    b_close = pg.QtWidgets.QPushButton('关闭')
-    b_close.clicked.connect(dlg.close)
-    btns.addStretch(1)
-    btns.addWidget(b_csv)
-    btns.addWidget(b_close)
-    lay.addLayout(btns)
-    _evt_dialog = dlg
-    dlg.show()
+    src_file = next((e['source_file'] for e in evs if e['source_file']), '')
+    src_size = next((e['file_size'] for e in evs
+                     if e['file_size'] is not None), None)
+    src_hash = next((e['file_hash'] for e in evs if e['file_hash']), None)
+    join_wanted = any(e['join'] for e in evs)
+    # SERIES-level paths (not the bare trace leaves): see
+    # _doc_restore_context -- leaf selection drops event-less sweeps and
+    # compresses the join axis for everything after them.
+    refs = sorted({e['trace_ref'][:2] for e in evs if e['trace_ref']})
+    _doc_set_context(src_file, src_size, join_wanted, refs,
+                     csv_dir=os.path.dirname(absp), src_hash=src_hash)
+
+    # -- i_seg for rows live on the current display: their trace's
+    # position among the displayed ones (joined rows stay 0)
+    for rec in grab_records:
+        k = _grab_ref_display_pos(rec)
+        rec['i_seg'] = 0 if (k is None or _join_active) else k
+
+    _grab_focus_gid = None
+    first = next((r['id'] for r in grab_records
+                  if _grab_rec_source_matches(r)), None)
+    if first is None and grab_records:
+        first = grab_records[0]['id']
+    _grab_selected = None
+    _refresh_grab_list()
+    if first is not None:
+        _grab_select(first)
+    _grab_show_overlays()
+
+    # -- report (silent when everything attached cleanly)
+    live = sum(1 for r in grab_records if _grab_rec_source_matches(r))
+    resolved = 0
+    hows = set()
+    for r in grab_records:
+        if not _grab_row_file_ok(r):
+            continue
+        _idx, how = _grab_resolve_ref(r.get('trace_ref'))
+        if _idx is not None:
+            resolved += 1
+            if how:
+                hows.add(how)
+    notes = []
+    if bad:
+        notes.append(T('csv.note.bad', n=bad))
+    in_file = resolved - live
+    other = len(grab_records) - resolved
+    if live < len(grab_records):
+        notes.append(T('csv.note.live', n=live))
+    if in_file > 0:
+        notes.append(T('csv.note.infile', n=in_file))
+    if other > 0:
+        notes.append(T('csv.note.other', n=other))
+    if 'content?' in hows:
+        notes.append(T('csv.note.cand'))
+    elif 'content' in hows:
+        notes.append(T('csv.note.content'))
+    if notes:
+        pg.QtWidgets.QMessageBox.information(
+            win, T('csv.imp.title'),
+            T('csv.report', n=len(grab_records),
+              notes='\n· '.join(notes)))
+
+
+class _DeleteKeyFilter(pg.QtCore.QObject):
+    """App-wide Ctrl+Delete (Win/Linux) / Cmd+Delete (macOS) deletes the
+    CURRENT SELECTION, resolved by state in _delete_current_selection:
+    last-touched grab rectangle > selected event row > Measure results.
+    Installed as an APPLICATION filter (not a QShortcut, which would eat
+    the key from every text field) with an explicit passthrough: while a
+    text widget holds focus the key stays native (Cmd+Backspace =
+    delete-to-line-start, Ctrl+Backspace = delete-word). Both physical
+    keys count as "Delete" here: the macOS keyboard's delete key IS
+    Backspace -- matching only Key_Delete (fn+delete) made the shortcut
+    look dead on Macs. Bare Delete/Backspace stays bound to zoom-undo."""
+
+    def eventFilter(self, obj, ev):
+        if (ev.type() == pg.QtCore.QEvent.KeyPress
+                and ev.key() in (pg.QtCore.Qt.Key_Delete,
+                                 pg.QtCore.Qt.Key_Backspace)
+                and (ev.modifiers() & (pg.QtCore.Qt.ControlModifier
+                                        | pg.QtCore.Qt.MetaModifier))):
+            fw = pg.QtWidgets.QApplication.focusWidget()
+            if isinstance(fw, (pg.QtWidgets.QLineEdit,
+                               pg.QtWidgets.QTextEdit,
+                               pg.QtWidgets.QPlainTextEdit,
+                               pg.QtWidgets.QAbstractSpinBox)):
+                return False            # native text editing behaviour
+            if _delete_current_selection():
+                return True
+        return pg.QtCore.QObject.eventFilter(self, obj, ev)
+
+
+_delete_keys = _DeleteKeyFilter()
+app.installEventFilter(_delete_keys)
+
+
+class _ModeClickFilter(pg.QtCore.QObject):
+    """App-wide click watcher arming the Shift+drag gesture: the analysis
+    area whose widget tree contains the press target owns the gesture --
+    a press inside the Amplitude column arms amplitude mode, a press
+    inside the Event panel arms event mode. Presses anywhere else (main
+    plot, left column, dialogs) leave the mode alone: the plot is a
+    shared canvas and never switches the mode itself."""
+
+    def eventFilter(self, obj, ev):
+        if (ev.type() == pg.QtCore.QEvent.MouseButtonPress
+                and isinstance(obj, pg.QtWidgets.QWidget)):
+            w = obj
+            while w is not None:
+                if w is amp_col:
+                    _set_ui_mode('amp')
+                    break
+                if w is sec_dist:
+                    _set_ui_mode('event')
+                    break
+                w = w.parentWidget()
+        return pg.QtCore.QObject.eventFilter(self, obj, ev)
+
+
+_mode_clicks = _ModeClickFilter()
+app.installEventFilter(_mode_clicks)
+
+grab_tree.currentItemChanged.connect(lambda *_: _grab_tree_changed())
+grab_tree.itemDoubleClicked.connect(_grab_tree_doubleclicked)
+grab_tree.header().sectionClicked.connect(_grab_header_clicked)
+grab_viewall_btn.toggled.connect(lambda *_: _grab_show_overlays())
+grab_clear_btn.clicked.connect(_grab_clear)
+grab_recalc_btn.clicked.connect(_grab_recalc_all)
+new_doc_btn.clicked.connect(lambda *_: _doc_new())
+doc_new_btn.clicked.connect(lambda *_: _doc_new())
+doc_tabs.tabCloseRequested.connect(lambda i: _doc_close_tab(i))
+doc_tabs.currentChanged.connect(lambda i: _doc_switch(i))
+doc_save_btn.clicked.connect(lambda *_: _doc_save())
+doc_saveas_btn.clicked.connect(lambda *_: _doc_saveas())
+exp_list.itemDoubleClicked.connect(_exp_double_clicked)
+exp_list.itemChanged.connect(_exp_item_changed)
+exp_up.clicked.connect(lambda *_: _exp_up())
+exp_csv_only.toggled.connect(_exp_csv_toggled)
+
+# Document shortcuts (StandardKey = Cmd on macOS, Ctrl elsewhere). Plain
+# WindowShortcut context on the main window: modal dialogs block them
+# naturally, focus anywhere inside the window triggers them. The handlers
+# themselves no-op without an open document (_doc is _DOC_CLOSED).
+for _seq, _fn in ((pg.QtGui.QKeySequence.New, _doc_new),
+                  (pg.QtGui.QKeySequence.Save, _doc_save),
+                  (pg.QtGui.QKeySequence.SaveAs, _doc_saveas)):
+    _sc_doc = QShortcut(pg.QtGui.QKeySequence(_seq), win)
+    _sc_doc.activated.connect(lambda fn=_fn: fn())
 
 
 # Debounced refresh of the amplitude histogram while the user zooms the main
@@ -2122,38 +5221,6 @@ def _main_range_changed(*_):
         _follow_timer.start()
 
 
-# Band drag: ZERO detection while dragging -- computation and marking only
-# happen after the gesture finishes. pyqtgraph's setRegion emits BOTH
-# sigRegionChanged and sigRegionChangeFinished (even programmatically), so
-# every handler is guarded by _band_syncing/_amp_syncing: only real user
-# drags of the lines reach the commit.
-def _band_region_changed(*_):
-    _sync_fields_from_band()          # field echo only -- no computation
-
-
-def _band_region_commit(*_):
-    if not _band_syncing:
-        run_detection()               # the gesture is finished: full run
-
-
-band_region.sigRegionChanged.connect(_band_region_changed)
-band_region.sigRegionChangeFinished.connect(_band_region_commit)
-evt_mode.currentIndexChanged.connect(lambda *_: run_detection())
-evt_k._cb = lambda *_: run_detection()
-evt_tmin._cb = lambda *_: run_detection()
-evt_merge._cb = lambda *_: run_detection()
-evt_head._cb = lambda *_: run_detection()
-evt_smooth._cb = lambda *_: run_detection()
-evt_duty._cb = lambda *_: run_detection()
-evt_ccdf.toggled.connect(lambda *_: run_detection())
-evt_lo._cb = _sync_band_from_fields
-evt_hi._cb = _sync_band_from_fields
-evt_clear_btn.clicked.connect(_evt_clear)
-evt_table_btn.clicked.connect(_show_event_table)
-evt_csv_btn.clicked.connect(_export_events_csv)
-evt_dwell_log.toggled.connect(lambda *_: run_detection())
-for _ln in (dwell_ma, dwell_mb, level_ma, level_mb):
-    _ln.sigPositionChanged.connect(_update_evt_meas)
 amp_auto_bins.toggled.connect(lambda *_: amp_recompute())
 amp_bins._cb = lambda *_: amp_recompute()
 amp_follow.toggled.connect(lambda *_: amp_recompute())
@@ -2164,19 +5231,29 @@ ruler_a.sigPositionChanged.connect(_update_ruler)
 ruler_b.sigPositionChanged.connect(_update_ruler)
 amp_clear_btn.clicked.connect(
     lambda: (clear_amp_regions(), _refresh_region_list(), amp_recompute()))
+vb.sigYRangeChanged.connect(_amp_follow_main_y)
 vb.sigRangeChanged.connect(_main_range_changed)
 clear_btn.clicked.connect(clear_analysis)
-dist_tabs.currentChanged.connect(_dist_view_changed)
-sec_dist.btn.clicked.connect(_dist_view_changed)
+sec_dist.btn.clicked.connect(_event_panel_toggled)
+amp_col.btn.clicked.connect(_amp_col_toggled)
 
 
-# initial hints + persisted state. Deliberately NOT persisted: the
-# Add-region arm / detection arm (the open tab IS the arm now) -- the app
-# always starts clean, like Measure. The last active tab is remembered.
-run_detection()
+# initial hints + persisted state. Deliberately NOT persisted: the mode
+# (which area was clicked last) -- the app always starts in event mode,
+# like Measure. The amp column's fold state IS remembered below.
 amp_recompute()
+_grab_show_selected()
 _refresh_region_list()
-dist_tabs.setCurrentIndex(int(settings.value('dist/tab', 0, type=int)))
+_refresh_grab_list()
+_refresh_mode_hints()
+
+# explorer startup dir: last browsed dir, else the last data dir, else home
+_exp_root0 = settings.value('explorer/dir', '') or ''
+if not os.path.isdir(_exp_root0):
+    _exp_root0 = settings.value('last_dir', '') or ''
+if not os.path.isdir(_exp_root0):
+    _exp_root0 = os.path.expanduser('~')
+_exp_set_root(_exp_root0)
 
 # load Heka's demo bundle if it is present
 demo = 'DemoV9Bundle.dat'
@@ -2195,37 +5272,125 @@ def _restore_layout():
     if vs:
         vsplit.setSizes([int(s) for s in vs])
     else:
-        vsplit.setSizes((380, 200, 150))
+        # [info, tree, nano]: compact info strip up top, tree dominates
+        vsplit.setSizes((150, 380, 200))
     ds = settings.value('layout/distsplit')
     if ds:
         dist_split.setSizes([int(s) for s in ds])
     else:
         dist_split.setSizes((600, 220))
+    gs = settings.value('layout/grabsplit')
+    # legacy saves hold THREE sizes (zoom | tree | files, before the file
+    # column moved to its own document splitter): the inner splitter keeps
+    # the first two panes, the outer document pane absorbs their sum
+    if gs and len(gs) == 3:
+        grab_split.setSizes([int(gs[0]), int(gs[1])])
+        doc_split.setSizes([int(gs[0]) + int(gs[1]), int(gs[2])])
+    elif gs and len(gs) == 2:
+        grab_split.setSizes([int(s) for s in gs])
+    else:
+        grab_split.setSizes((520, 260))
+    if not (gs and len(gs) == 3):
+        ts2 = settings.value('layout/docsplit')
+        if ts2 and len(ts2) == 2:
+            doc_split.setSizes([int(s) for s in ts2])
+        else:
+            doc_split.setSizes((2400, 320))
+    # amp column starts FOLDED on first launch (default True); the other
+    # sections default to expanded. dist/tab died with the tab widget.
+    settings.remove('dist/tab')
     for key, sec in (('tree', sec_tree), ('nano', sec_nano), ('info', sec_info),
-                     ('dist', sec_dist)):
+                     ('dist', sec_dist), ('files', exp_col)):
         sec.set_collapsed(settings.value('layout/collapsed/' + key, False, type=bool))
+    # left-column sections: seed the unfold height for still-folded ones.
+    # The collapse transition above snapshots the live pane size -- which
+    # is the STRIP (or pre-layout junk) at this point, never the height
+    # the user had dragged. Same poison-and-seed pattern as the amp
+    # column's _restore, which wins because it runs after the snapshot.
+    for key, sec in (('tree', sec_tree), ('nano', sec_nano),
+                     ('info', sec_info)):
+        v = settings.value('layout/vopen/' + key)
+        if sec.is_collapsed() and v:
+            sec._restore = int(v)
+    amp_col.set_collapsed(
+        settings.value('layout/collapsed/amp', True, type=bool))
+    # amp width: remembered width wins; first launch = 15% of the window
+    # (the unmanaged splitter default was far too wide). Seeding _restore
+    # AFTER the collapse call: collapsing snapshots the live pane size as
+    # the unfold width, and that snapshot is unreliable before the first
+    # layout pass -- the explicit seed makes the unfold deterministic.
+    # A FOLDED pane must sit at strip width: QSplitter.setSizes only
+    # raises values below the minimum hint and IGNORES maximumWidth, so
+    # handing the saved EXPANDED width to the folded pane leaves it wide
+    # and contentless (only the fold arrow). set_collapsed early-returns
+    # once the flag is set, hence the direct strip assignment here.
+    ts = settings.value('layout/ampsplit')
+    if ts and len(ts) == 2:
+        amp_w = int(ts[1])
+    else:
+        amp_w = max(240, int(win.width() * 0.15))
+    amp_col._restore = amp_w
+    if amp_col.is_collapsed():
+        amp_col._splitter_assign(amp_col.strip_width())
+    elif ts and len(ts) == 2:
+        top_split.setSizes([int(ts[0]), int(ts[1])])
+    else:
+        top_split.setSizes([max(240, win.width() - amp_w), amp_w])
+    # normalize mode-dependent state after programmatic folds
+    _amp_col_toggled()
+    _event_panel_toggled()
 
 
 _restore_layout()
+
+# Re-run the restore on the first event-loop tick: sizes set BEFORE the
+# window's first real layout pass get clobbered -- the layout's minimum
+# width grows the window (1200 -> ~1657 px) and QSplitter redistributes
+# panes from size hints, ignoring the requested sizes. That was the
+# long-standing "launch defaults / persisted layouts don't stick" quirk
+# (and it made the amp column open at half the window). By the first
+# tick the geometry is final, setSizes sticks, and the 15%-of-window
+# default is computed against the REAL window width.
+pg.QtCore.QTimer.singleShot(0, _restore_layout)
 
 
 def _save_layout():
     settings.setValue('layout/hsplit', list(hsplit.sizes()))
     settings.setValue('layout/vsplit', list(vsplit.sizes()))
+    # folded left-column sections persist their UNFOLD height separately:
+    # the vsplit list above holds the STRIP height for them, and the
+    # in-memory _restore would otherwise die with the process (expanding
+    # after a restart used to fall back to the ~150 default). Expanded
+    # sections remove the key so stale heights can never leak back.
+    for key, sec in (('tree', sec_tree), ('nano', sec_nano),
+                     ('info', sec_info)):
+        k_open = 'layout/vopen/' + key
+        if sec.is_collapsed() and getattr(sec, '_restore', 0):
+            settings.setValue(k_open, int(sec._restore))
+        else:
+            settings.remove(k_open)
     settings.setValue('layout/distsplit', list(dist_split.sizes()))
+    # save the UNFOLDED amp width: quitting while collapsed stores the
+    # strip width, which would become the unfold-restore width otherwise
+    if amp_col.is_collapsed() and getattr(amp_col, '_restore', 0):
+        _aw = int(amp_col._restore)
+        settings.setValue('layout/ampsplit',
+                          [max(240, sum(top_split.sizes()) - _aw), _aw])
+    else:
+        settings.setValue('layout/ampsplit', list(top_split.sizes()))
+    settings.setValue('layout/grabsplit', list(grab_split.sizes()))
+    settings.setValue('layout/docsplit', list(doc_split.sizes()))
+    settings.setValue('grab/mode', grab_mode.currentText())
+    settings.setValue('grab/k', grab_k.value())
+    settings.setValue('grab/t_min_ms', grab_tmin.value())
+    settings.setValue('grab/merge', grab_merge.value())
+    settings.setValue('grab/head', grab_head.value())
+    settings.setValue('grab/smooth', grab_smooth.value())
+    settings.setValue('grab/duty', grab_duty.value())
     for key, sec in (('tree', sec_tree), ('nano', sec_nano), ('info', sec_info),
-                     ('dist', sec_dist)):
+                     ('dist', sec_dist), ('files', exp_col)):
         settings.setValue('layout/collapsed/' + key, sec.is_collapsed())
-    settings.setValue('dist/mode', evt_mode.currentText())
-    settings.setValue('dist/k', evt_k.value())
-    settings.setValue('dist/t_min_ms', evt_tmin.value())
-    settings.setValue('dist/merge', evt_merge.value())
-    settings.setValue('dist/head', evt_head.value())
-    settings.setValue('dist/smooth', evt_smooth.value())
-    settings.setValue('dist/duty', evt_duty.value())
-    settings.setValue('dist/dwell_log', evt_dwell_log.isChecked())
-    settings.setValue('dist/ccdf', evt_ccdf.isChecked())
-    settings.setValue('dist/tab', dist_tabs.currentIndex())
+    settings.setValue('layout/collapsed/amp', amp_col.is_collapsed())
     settings.setValue('amp/bins_auto', amp_auto_bins.isChecked())
     settings.setValue('amp/bins', amp_bins.value())
     settings.setValue('amp/follow', amp_follow.isChecked())
@@ -2236,4 +5401,3 @@ app.aboutToQuit.connect(_save_layout)
 # Start the Qt event loop unless the user is in an interactive prompt
 if sys.flags.interactive == 0:
     app.exec_()
-    

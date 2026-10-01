@@ -228,6 +228,45 @@ def test_t_head_ignores_transient():
     assert abs(keep.events[0]['t_start'] - 100 * 5e-5) < 3 * 5e-5
 
 
+def test_slice_segments():
+    """Time-scope slicing: keep in-span samples, drop empty segments,
+    subsample after slicing."""
+    n = 10000
+    segs = [(_ramp(n), np.full(n, 25.0)), (_ramp(n), np.full(n, -5.0))]
+    out = analysis.slice_segments(segs, 1000 * 5e-5, 2000 * 5e-5)
+    assert len(out) == 2
+    assert len(out[0][0]) == 1001 and len(out[1][1]) == 1001
+    assert abs(out[0][0][0] - 1000 * 5e-5) < 1e-12
+    assert abs(out[0][0][-1] - 2000 * 5e-5) < 1e-12
+    assert analysis.slice_segments(segs, 2.0, 3.0) == []      # no overlap
+    out = analysis.slice_segments(segs, 0.0, 1.0, stride=100)
+    assert len(out[0][0]) == 100
+    assert analysis.slice_segments([], 0.0, 1.0) == []
+
+
+def test_slice_scoped_detection_edges():
+    """Grab-tab semantics: events straddling a slice edge are discarded
+    (boundary), events complete inside the slice are kept with unchanged
+    dwell."""
+    n = 20000
+    y = _series(-100.0, [(1000, 1500), (3000, 3500), (6000, 8000)], n, (10, 40))
+    t = _ramp(n)
+    kw = dict(mode='inside', lo=10.0, hi=40.0, h=1.0, t_min=3)
+    # slice [2000, 6800]: event 1 outside; event 2 complete; event 3 enters
+    # before 6800 but never exits inside the slice -> boundary
+    segs = analysis.slice_segments([(t, y)], 2000 * 5e-5, 6800 * 5e-5)
+    res = analysis.detect_events_segments(segs, **kw)
+    assert len(res.events) == 1, res.events
+    assert abs(res.events[0]['t_start'] - 3000 * 5e-5) < 2 * 5e-5
+    assert abs(res.events[0]['dwell'] - 500 * 5e-5) < 3 * 5e-5
+    assert res.boundary_discarded == 1
+    # event already inside at the slice start -> boundary as well
+    segs = analysis.slice_segments([(t, y)], 3200 * 5e-5, 4000 * 5e-5)
+    res = analysis.detect_events_segments(segs, **kw)
+    assert len(res.events) == 0, res.events
+    assert res.boundary_discarded == 1
+
+
 def test_in_band_fraction():
     n = 1000
     y = np.full(n, -100.0)
