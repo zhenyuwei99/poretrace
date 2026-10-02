@@ -45,7 +45,7 @@ jobs:
         run: python test_analysis.py
 
       - name: PyInstaller
-        run: python -m PyInstaller heka_browser.spec --noconfirm --clean
+        run: python -m PyInstaller poretrace.spec --noconfirm --clean
 
       - name: Package zip (macOS)
         if: runner.os == 'macOS'
