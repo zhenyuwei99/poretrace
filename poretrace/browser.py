@@ -2,10 +2,10 @@ import os, sys, time, csv, hashlib
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pyqtgraph as pg
 import numpy as np
-from heka import reader as heka_reader
-from heka import analysis
-from heka.nanopore import calculate_pore_diameter, get_conductivity
-from heka.i18n import T, L10N, THEME, _ui_lang  # flat re-export: smoke tests reach these as module globals
+from poretrace import reader as heka_reader
+from poretrace import analysis
+from poretrace.nanopore import calculate_pore_diameter, get_conductivity
+from poretrace.i18n import T, L10N, THEME, _ui_lang  # flat re-export: smoke tests reach these as module globals
 
 
 def trace_pen(i, total):

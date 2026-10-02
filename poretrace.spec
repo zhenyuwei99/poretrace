@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-# PyInstaller spec for the Heka .dat browser -- onedir on all platforms.  Artifacts are named poretrace.
+# PyInstaller spec for poretrace (HEKA .dat browser) -- onedir on all platforms.  Artifacts are named poretrace.
 #
 # onedir (instead of onefile) removes the per-launch temp-extraction step,
 # making startup ~3-8x faster and consistent between cold and warm launches.
@@ -7,7 +7,7 @@
 #   macOS:    dist/poretrace.app  (+ poretrace-mac.zip)
 #   Windows:  dist/poretrace/poretrace.exe  (+ poretrace-windows.zip)
 #   Linux:    dist/poretrace/poretrace  (+ poretrace-linux.zip)
-# Build with:  python -m PyInstaller heka_browser.spec --noconfirm --clean
+# Build with:  python -m PyInstaller poretrace.spec --noconfirm --clean
 
 import platform
 

@@ -6,9 +6,8 @@
 # before a release); the release job is gated on a tag ref.
 #
 # Matrix notes:
-#   macos-latest   -> Apple Silicon (arm64)
-#   macos-13       -> Intel (x64); image is scheduled for retirement, drop
-#                     this entry or switch to universal2 when it goes away
+#   macos-latest   -> Apple Silicon (arm64); Intel dropped 2026-10: free-tier
+#                     macos-13 queues exceeded 2h and the image is retiring
 #   ubuntu-22.04   -> oldest glibc we support; runs on 22.04/24.04+
 name: release
 
@@ -27,7 +26,6 @@ jobs:
       matrix:
         include:
           - { os: macos-latest,   asset: poretrace-mac-arm64.zip }
-          - { os: macos-13,       asset: poretrace-mac-intel.zip }
           - { os: windows-latest, asset: poretrace-windows.zip }
           - { os: ubuntu-22.04,   asset: poretrace-linux.zip }
     runs-on: ${{ matrix.os }}

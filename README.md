@@ -12,7 +12,7 @@
 | `analysis.py` | 时间序列分析库（纯 numpy）：阈值带+滞回事件检测、直方图、存活函数；GUI 与 notebook 共用同一入口 |
 | `test_analysis.py` | `analysis.py` 的无头测试（合成数据，`python3 test_analysis.py` 直接跑） |
 | `browser.py` | 交互式 GUI 浏览器（pyqtgraph）：浏览、测量、分布分析、孔径计算 |
-| `launcher.py` + `heka_browser.spec` | PyInstaller 打包入口与配置（见第 6 节） |
+| `launcher.py` + `poretrace.spec` | PyInstaller 打包入口与配置（见第 6 节） |
 | `build_mac.sh` / `build_windows.bat` / `build_linux.sh` | 三平台一键构建脚本 |
 
 ## 环境要求
@@ -28,7 +28,7 @@
 
 ```bash
 cd experiment
-python heka/browser.py        # 任意工作目录直接运行也可以，已内置路径自举
+python poretrace/browser.py        # 任意工作目录直接运行也可以，已内置路径自举
 ```
 
 ### 1.2 操作
@@ -47,7 +47,7 @@ python heka/browser.py        # 任意工作目录直接运行也可以，已内
 4. **多选**：`Cmd+点击`（macOS）/ `Ctrl+点击` 追加，`Shift+点击` 选范围；多选结果取并集自动去重
 5. 曲线超过 20 条时自动隐藏图例；右下角面板显示选中节点的全部元数据（采样、单位、放大器状态等）。左侧面板最宽 480 px，宽屏时富余空间自动留给绘图区
 6. **左列布局**：按钮行（固定）下方是三个**可折叠区块**——`▾ 文件信息`（路径栏 + 元数据树，置顶） / `▾ 文件树` / `▾ 纳米孔计算器`，区块间有分割条可任意拖动分配高度；点击标题折叠/展开（折叠后只剩一行标题）。文件信息可压到很矮（无最小高度限制，适合当紧凑状态条用）；**折叠状态、分割位置与折叠区块的展开高度跨会话记忆**，下次打开自动还原。**全部分割条（左右 / 左列各区 / 主图↔幅度列 / 主图↔Event 面板 / Event 面板左右各列）都是可见的灰色圆角条，悬停变蓝**——直接抓取拖动即可调整大小
-7. **配色**：浅色现代主题（米白背景 + 深灰文字），整个应用**强制浅色**（Fusion 样式 + 浅色调色板，不受 macOS 深色模式影响，三平台外观一致）。曲线色环分三档：≤10 条 Tableau 10，11–20 条 Tableau 20（深浅两版），>20 条低饱和金比例色相环（S=.55/V=.78，几百条也柔和可辨，颜色按序号确定不漂移）；十字光标橙色、A/B 标记红/蓝、读数为半透明白底浮框、图例白底。全部颜色集中在 `heka/i18n.py` 的 `THEME` 字典（`browser.py` 顶部导入），想微调只改这一处
+7. **配色**：浅色现代主题（米白背景 + 深灰文字），整个应用**强制浅色**（Fusion 样式 + 浅色调色板，不受 macOS 深色模式影响，三平台外观一致）。曲线色环分三档：≤10 条 Tableau 10，11–20 条 Tableau 20（深浅两版），>20 条低饱和金比例色相环（S=.55/V=.78，几百条也柔和可辨，颜色按序号确定不漂移）；十字光标橙色、A/B 标记红/蓝、读数为半透明白底浮框、图例白底。全部颜色集中在 `poretrace/i18n.py` 的 `THEME` 字典（`browser.py` 顶部导入），想微调只改这一处
 8. **缩放与导航**：
 
 | 操作 | 行为 |
@@ -124,7 +124,7 @@ d = I/(2σV) × (1 + √(1 + 16σL/(πG)))
 电导率 σ 按 25 °C 查表（0.001–5 M），超出范围取端点值，表内线性插值。计算接口也可在脚本中直接使用：
 
 ```python
-from heka import get_conductivity, calculate_pore_diameter
+from poretrace import get_conductivity, calculate_pore_diameter
 
 sigma = get_conductivity("KCl", 1.0)          # 11.18 S/m
 d = calculate_pore_diameter(1e-9, 0.1,        # I (A), V (V)
@@ -138,7 +138,7 @@ d = calculate_pore_diameter(1e-9, 0.1,        # I (A), V (V)
 分析功能分两处：**幅度列**（主图右侧 `»` 可折叠列，默认收起，**展开宽度默认 = 窗口宽度的 15%**——拖分割条可调、位置跨会话记忆，主图吸收全部富余空间）看幅度分布，**Event 事件面板**（主图下方 `▾ 事件` 可折叠面板）抓取事件。**激活 = 最后点击的区域**：点击幅度列任意处 → 幅度模式（Shift+横向拖拽选段）；点击 Event 面板任意处 → 事件模式（Shift+拖拽画矩形，启动默认即此模式）；主图/左列点击不改模式（共享画布）。**激活状态高亮可见**：当前持手势一侧的面板提示文字显示为**蓝色加粗标签（浅蓝底 pill）**，对应**区块标题（`»` / `▾` 折叠条）文字也染蓝**——一眼看出 Shift+拖拽会画出什么。**折叠幅度列 = 清除全部区域并回落事件模式**；折叠 Event 面板 = 矩形冻结但**记录保留**。分析永远基于**每条曲线的原始采样数组**（Join 时基于拼接连续轴），由纯 numpy 库 `analysis.py` 完成——GUI 与脚本共用同一入口（批量/全数据检测用 notebook 直接调这个库，GUI 专注逐个甄别采集）：
 
 ```python
-from heka.analysis import detect_events, detect_events_segments, slice_segments, all_point_histogram
+from poretrace.analysis import detect_events, detect_events_segments, slice_segments, all_point_histogram
 ```
 
 **手势约定**（分析选择与浏览互不干扰）：
@@ -196,7 +196,7 @@ import os
 import sys
 sys.path.insert(0, os.path.abspath("../.."))   # 路径按你的运行位置调整
 
-from heka import HekaFile
+from poretrace import HekaFile
 ```
 
 `os.path.abspath` 的参数写法取决于你在哪里运行：
@@ -212,7 +212,7 @@ from heka import HekaFile
 ```python
 import sys
 sys.path.insert(0, "/Users/zhenyuwei/nutstore/paper/25-12-spike-transport/experiment")
-from heka import HekaFile
+from poretrace import HekaFile
 ```
 
 判断标准：`sys.path` 里的目录下必须能找到 `heka/` 这个文件夹。
@@ -277,7 +277,7 @@ import sys
 sys.path.insert(0, os.path.abspath("../.."))
 
 import matplotlib.pyplot as plt
-from heka import HekaFile
+from poretrace import HekaFile
 
 rec = HekaFile("data.dat")
 rec.list()
@@ -323,7 +323,7 @@ plt.show()
 `HekaFile` 不够用时可直接用底层 API：
 
 ```python
-from heka import Bundle
+from poretrace import Bundle
 
 b = Bundle("data.dat")
 pul = b.pul                      # 元数据树

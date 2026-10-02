@@ -25,7 +25,7 @@ python -m pip install --upgrade pip
 python -m pip install "pyqt5" "pyqtgraph" "numpy" "pyinstaller"
 
 # 3) build
-python -m PyInstaller heka_browser.spec --noconfirm --clean
+python -m PyInstaller poretrace.spec --noconfirm --clean
 
 # 4) zip for distribution (ditto preserves the .app bundle structure)
 cd dist

@@ -4,4 +4,4 @@ The browser module builds the whole UI at import time and enters the Qt
 event loop at the end, so importing it here is the entire app.
 """
 
-from heka import browser  # noqa: F401
+from poretrace import browser  # noqa: F401

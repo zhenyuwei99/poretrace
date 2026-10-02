@@ -16,7 +16,7 @@ source build-venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install pyqt5 pyqtgraph numpy pyinstaller
 
-python -m PyInstaller heka_browser.spec --noconfirm --clean
+python -m PyInstaller poretrace.spec --noconfirm --clean
 
 # zip for distribution
 cd dist

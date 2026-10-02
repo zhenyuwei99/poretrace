@@ -14,7 +14,7 @@ call build-venv\Scripts\activate.bat
 python -m pip install --upgrade pip
 python -m pip install pyqt5 pyqtgraph numpy pyinstaller
 
-python -m PyInstaller heka_browser.spec --noconfirm --clean
+python -m PyInstaller poretrace.spec --noconfirm --clean
 
 rem zip for distribution
 powershell -NoProfile -Command "Compress-Archive -Path 'dist\poretrace\*' -DestinationPath 'dist\poretrace-windows.zip' -Force"

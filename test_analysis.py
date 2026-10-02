@@ -1,4 +1,4 @@
-"""Headless tests for heka.analysis (pure numpy, no GUI, no pytest needed).
+"""Headless tests for poretrace.analysis (pure numpy, no GUI, no pytest needed).
 
 Run:  python3 test_analysis.py
 Every case uses deterministic synthetic series; tolerances are in samples.
@@ -10,7 +10,7 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # repo root, wherever it is checked out
-from heka import analysis
+from poretrace import analysis
 
 
 def _ramp(n):
